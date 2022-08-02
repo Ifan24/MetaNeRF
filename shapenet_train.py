@@ -19,6 +19,9 @@ import matplotlib.pyplot as plt
 from collections import OrderedDict
 import gc
 
+from datetime import datetime
+import os
+
 def prepare_MAML_data(imgs, poses, batch_size, hwf):
     '''
         split training images to support set and target set
@@ -26,8 +29,9 @@ def prepare_MAML_data(imgs, poses, batch_size, hwf):
         size(target set) = MAML_batch_size
     '''
     # shuffle the images
-    imgs = imgs[torch.randperm(imgs.shape[0])]
-    poses = poses[torch.randperm(poses.shape[0])]
+    indexes = torch.randperm(imgs.shape[0])
+    imgs = imgs[indexes]
+    poses = poses[indexes]
     
     target_imgs, target_poses = imgs[:batch_size], poses[:batch_size]
     imgs, poses = imgs[batch_size:], poses[batch_size:] 
@@ -263,18 +267,30 @@ def main():
                         help='use scheduler to adjust outer loop lr')   
     parser.add_argument('--checkpoint_path', type=str,
                         help='path to saved checkpoint')   
+    parser.add_argument('--make_checkpoint_dir', action='store_true',
+                        help='make a directory in checkpoint_path with name as current time')
                         
     args = parser.parse_args()
-    
     
     with open(args.config) as config:
         info = json.load(config)
         for key, value in info.items():
-            # don't overwrite the args if exist
-            if args.__dict__[key] is None:
-                args.__dict__[key] = value
-            
-    print(args)
+            args.__dict__[key] = value
+    
+    print(vars(args))
+    
+    if args.make_checkpoint_dir:
+        # dd/mm/YY H:M:S
+        now = datetime.now().strftime("%d-%m-%Y-%H-%M-%S")
+        checkpoint_path = f"{args.checkpoint_path}/{now}"
+        os.makedirs(checkpoint_path, exist_ok=True)
+        print(f"make directory {checkpoint_path}")
+        args.checkpoint_path = checkpoint_path
+        
+        with open(f'{args.checkpoint_path}/config.json', 'w') as fp:
+            json.dump(vars(args), fp)
+        
+        
     use_reptile = args.meta == 'Reptile'
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -301,7 +317,7 @@ def main():
     step_size = args.inner_lr
     scheduler = None
     if args.use_scheduler:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=meta_optim, T_max=args.max_iters/10, eta_min=args.meta_lr/10)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=meta_optim, T_max=args.max_iters, eta_min=args.scheduler_min_lr)
                                                               
     if args.per_param_step_size:
         step_size = OrderedDict((name, torch.tensor(step_size,
@@ -382,7 +398,7 @@ def main():
             meta_optim.step()
         
             if step % args.val_freq == 0 and step != args.resume_step:
-                if args.meta == 'MAML' and (args.per_param_step_size or args.learn_step_size):
+                if args.per_param_step_size or args.learn_step_size:
                     train_psnrs.append((step, -10*torch.log10(outer_loss).detach().cpu()))
                     torch.cuda.empty_cache()
                     # show one of the validation result
@@ -401,7 +417,7 @@ def main():
                     val_psnr = torch.stack(test_psnrs).mean()
                     
                 else:
-                    val_psnr = val_meta(args, meta_model, val_loader, device, step_size)
+                    val_psnr = val_meta(args, meta_model, val_loader, device)
                 
                 print(f"step: {step}, val psnr: {val_psnr:0.3f}")
                 val_psnrs.append((step, val_psnr.cpu()))
@@ -413,6 +429,7 @@ def main():
                 plt.xlabel('Iterations')
                 plt.ylabel('PSNR')
                 plt.legend()
+                plt.savefig(f'{args.checkpoint_path}/{step}.png')
                 plt.show()
           
             if step % args.checkpoint_freq == 0 and step != args.resume_step:
