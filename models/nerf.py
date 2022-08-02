@@ -78,7 +78,7 @@ class SimpleNeRF(nn.Module):
 
 
 def build_nerf(args):
-    if args.meta == 'MAML' or args.reptile_torchmeta:
+    if args.meta == 'MAML' or args.per_param_step_size:
         model = MetaSimpleNeRF(in_features=3, max_freq=args.max_freq, num_freqs=args.num_freqs,
                         hidden_features=args.hidden_features, hidden_layers=args.hidden_layers,
                         out_features=4)

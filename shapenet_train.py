@@ -216,7 +216,7 @@ def validate_MAML(model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound,
     scene_psnr = torch.stack(view_psnrs).mean()
     return scene_psnr     
 
-def val_meta(args, model, val_loader, device):
+def val_meta(args, model, val_loader, device, step_size=None):
     """
     validate the meta trained model for few-shot view synthesis
     """
@@ -232,7 +232,17 @@ def val_meta(args, model, val_loader, device):
         tto_poses, test_poses = torch.split(poses, [args.tto_views, args.test_views], dim=0)
 
         val_model.load_state_dict(meta_trained_state)
-        val_optim = torch.optim.SGD(val_model.parameters(), args.tto_lr)
+        
+        if args.per_param_step_size:
+            params = []
+            for (name, param) in val_model.meta_named_parameters():
+                params.append({
+                    'params': param,
+                    'lr': step_size[name].item()
+                })
+            val_optim = torch.optim.SGD(params, args.tto_lr)
+        else:
+            val_optim = torch.optim.SGD(val_model.parameters(), args.tto_lr)
 
         inner_loop(val_model, val_optim, tto_imgs, tto_poses, hwf,
                     bound, args.num_samples, args.tto_batchsize, args.tto_steps)      
@@ -260,8 +270,6 @@ def main():
     # Meta-SGD
     parser.add_argument('--per_param_step_size', action='store_true',
                         help='the step size parameter is different for each parameter of the model. Has no impact unless `learn_step_size=True')
-    parser.add_argument('--reptile_torchmeta', action='store_true',
-                        help='use torchmeta framework for reptile inner loop')
     # MAML++
     parser.add_argument('--use_scheduler', action='store_true',
                         help='use scheduler to adjust outer loop lr')   
@@ -269,7 +277,8 @@ def main():
                         help='path to saved checkpoint')   
     parser.add_argument('--make_checkpoint_dir', action='store_true',
                         help='make a directory in checkpoint_path with name as current time')
-                        
+    parser.add_argument('--plot_lr', action='store_true',
+                        help='plot inner learning rates')                 
     args = parser.parse_args()
     
     with open(args.config) as config:
@@ -320,6 +329,8 @@ def main():
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=meta_optim, T_max=args.max_iters, eta_min=args.scheduler_min_lr)
                                                               
     if args.per_param_step_size:
+        inner_lrs = OrderedDict((name, [step_size]) for (name, param)
+            in meta_model.meta_named_parameters())
         step_size = OrderedDict((name, torch.tensor(step_size,
             dtype=param.dtype, device=device,
             requires_grad=args.learn_step_size)) for (name, param)
@@ -357,7 +368,16 @@ def main():
             
             if use_reptile:
                 inner_model = copy.deepcopy(meta_model)
-                inner_optim = torch.optim.SGD(inner_model.parameters(), args.inner_lr)
+                if args.per_param_step_size:
+                    params = []
+                    for (name, param) in inner_model.meta_named_parameters():
+                        params.append({
+                            'params': param,
+                            'lr': step_size[name].item()
+                        })
+                    inner_optim = torch.optim.SGD(params, args.inner_lr)
+                else:
+                    inner_optim = torch.optim.SGD(inner_model.parameters(), args.inner_lr)
         
                 inner_loop(inner_model, inner_optim, imgs, poses,
                             hwf, bound, args.num_samples,
@@ -367,6 +387,12 @@ def main():
                 with torch.no_grad():
                     for meta_param, inner_param in zip(meta_model.parameters(), inner_model.parameters()):
                         meta_param.grad = meta_param - inner_param
+                
+                if args.per_param_step_size:
+                    pbar.set_postfix({
+                        'inner_lr': step_size['net.1.weight'].item() if args.per_param_step_size else step_size.item(), 
+                        "outer_lr" : scheduler.get_last_lr()[0], 
+                    })
             # python shapenet_train.py --config configs/shapenet/chairs.json --meta MAML --learn_step_size --per_param_step_size 
             # MAML
             # https://github.com/tristandeleu/pytorch-meta/blob/master/examples/maml/train.py
@@ -398,9 +424,8 @@ def main():
             meta_optim.step()
         
             if step % args.val_freq == 0 and step != args.resume_step:
-                if args.per_param_step_size or args.learn_step_size:
+                if args.meta == 'MAML' and (args.per_param_step_size or args.learn_step_size):
                     train_psnrs.append((step, -10*torch.log10(outer_loss).detach().cpu()))
-                    torch.cuda.empty_cache()
                     # show one of the validation result
                     test_psnrs = []
                     for imgs, poses, hwf, bound in tqdm(val_loader, desc = 'Validating'):
@@ -415,9 +440,8 @@ def main():
                         test_psnrs.append(scene_psnr)
                 
                     val_psnr = torch.stack(test_psnrs).mean()
-                    
                 else:
-                    val_psnr = val_meta(args, meta_model, val_loader, device)
+                    val_psnr = val_meta(args, meta_model, val_loader, device, step_size)
                 
                 print(f"step: {step}, val psnr: {val_psnr:0.3f}")
                 val_psnrs.append((step, val_psnr.cpu()))
@@ -431,6 +455,18 @@ def main():
                 plt.legend()
                 plt.savefig(f'{args.checkpoint_path}/{step}.png')
                 plt.show()
+                print(val_psnrs)
+                
+                if args.plot_lr:
+                    plt.subplots()
+                    plt.ylabel("inner learning rate")
+                    plt.xlabel("iterations")
+                    plt.title("Change of per parameters inner learning rate")
+                    for (name, lrs) in inner_lrs.items():
+                        plt.plot(lrs, label=name)
+                    
+                    plt.legend()
+                    plt.show()
           
             if step % args.checkpoint_freq == 0 and step != args.resume_step:
                 path = f"{args.checkpoint_path}/step{step}.pth"
@@ -453,6 +489,10 @@ def main():
             
             if args.use_scheduler:
                 scheduler.step()
+                
+                if args.plot_lr:
+                    for (name, param) in meta_model.meta_named_parameters():
+                        inner_lrs[name].append(step_size[name].item())
                 
             step += 1
             pbar.update(1)
