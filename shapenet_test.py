@@ -126,6 +126,7 @@ def test():
         for key, value in info.items():
             args.__dict__[key] = value
 
+    print(args)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     test_set = build_shapenet(image_set="test", dataset_root=args.dataset_root,

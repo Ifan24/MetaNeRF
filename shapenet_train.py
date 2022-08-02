@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 from torchmeta.utils.gradient_based import gradient_update_parameters as GUP
 import matplotlib.pyplot as plt
 from collections import OrderedDict
+import gc
 
 def prepare_MAML_data(imgs, poses, batch_size, hwf):
     '''
@@ -24,6 +25,9 @@ def prepare_MAML_data(imgs, poses, batch_size, hwf):
         size(support set) = train_views - MAML_batch_size
         size(target set) = MAML_batch_size
     '''
+    # shuffle the images
+    imgs = imgs[torch.randperm(imgs.shape[0])]
+    poses = poses[torch.randperm(poses.shape[0])]
     
     target_imgs, target_poses = imgs[:batch_size], poses[:batch_size]
     imgs, poses = imgs[batch_size:], poses[batch_size:] 
@@ -44,8 +48,7 @@ def prepare_MAML_data(imgs, poses, batch_size, hwf):
             'target':[target_pixels, target_rays_o, target_rays_d, target_num_rays]
         }
                     
-def MAML_inner_loop(model, bound, num_samples, raybatch_size, inner_steps, 
-    alpha, train_data):
+def MAML_inner_loop(model, bound, num_samples, raybatch_size, inner_steps, alpha, train_data):
     pixels, rays_o, rays_d, num_rays = train_data['support']
     target_pixels, target_rays_o, target_rays_d, target_num_rays = train_data['target']
     
@@ -63,7 +66,7 @@ def MAML_inner_loop(model, bound, num_samples, raybatch_size, inner_steps,
         loss = F.mse_loss(colors, pixelbatch)
 
         model.zero_grad()
-        params = GUP(model, loss, params=params, step_size=alpha)
+        params = GUP(model, loss, params=params, step_size=alpha, first_order=True)
         
     # use the param from previous inner_steps on val views to get a outer loss
     indices = torch.randint(target_num_rays, size=[raybatch_size])
@@ -141,7 +144,73 @@ def report_result(model, imgs, poses, hwf, bound, num_samples, raybatch_size, tt
     plt.show()
     scene_psnr = torch.stack(view_psnrs).mean()
     return scene_psnr
+
+def validate_MAML(model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, step_size, args):
+    '''
+        train and report the result of model
+    '''
+    # prepare data
+    pixels = tto_imgs.reshape(-1, 3)
+    rays_o, rays_d = get_rays_shapenet(hwf, tto_poses)
+    rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
+    num_rays = rays_d.shape[0]
+    # TTO training
+    params = None
+    
+    for step in range(args.tto_steps):
+        indices = torch.randint(num_rays, size=[args.tto_batchsize])
+        raybatch_o, raybatch_d = rays_o[indices], rays_d[indices]
+        pixelbatch = pixels[indices] 
+        t_vals, xyz = sample_points(raybatch_o, raybatch_d, bound[0], bound[1],
+                                    args.num_samples, perturb=True)
         
+        rgbs, sigmas = model(xyz, params=params)
+        colors = volume_render(rgbs, sigmas, t_vals, white_bkgd=True)
+        loss = F.mse_loss(colors, pixelbatch)
+
+        model.zero_grad()
+        # OOM when tto_step>100 as MAML need to backprop to all those step
+        # https://github.com/tristandeleu/pytorch-maml/issues/21
+        params = GUP(model, loss, params=params, step_size=step_size, first_order=True)
+        
+        
+    # use the param from TTO on test imgs
+    ray_origins, ray_directions = get_rays_shapenet(hwf, test_poses)
+    view_psnrs = []
+    plt.figure(figsize=(15, 6))
+    count = 0
+    raybatch_size = args.test_batchsize
+    for img, rays_o, rays_d in zip(test_imgs, ray_origins, ray_directions):
+        rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
+        t_vals, xyz = sample_points(rays_o, rays_d, bound[0], bound[1],
+                                    args.num_samples, perturb=False)
+        
+        synth = []
+        num_rays = rays_d.shape[0]
+        with torch.no_grad():
+            for i in range(0, num_rays, raybatch_size):
+                rgbs_batch, sigmas_batch = model(xyz[i:i+raybatch_size], params=params)
+                color_batch = volume_render(rgbs_batch, sigmas_batch, 
+                                            t_vals[i:i+raybatch_size],
+                                            white_bkgd=True)
+                synth.append(color_batch)
+            synth = torch.clip(torch.cat(synth, dim=0).reshape_as(img), min=0, max=1)
+            error = F.mse_loss(img, synth)
+            psnr = -10*torch.log10(error)
+            view_psnrs.append(psnr)
+            
+            if count < args.tto_showImages:
+                plt.subplot(2, 5, count+1)
+                plt.imshow(img.cpu())
+                plt.title('Target')
+                plt.subplot(2,5,count+6)
+                plt.imshow(synth.cpu())
+                plt.title(f'synth psnr:{psnr:0.2f}')
+            count += 1
+            
+    plt.show()
+    scene_psnr = torch.stack(view_psnrs).mean()
+    return scene_psnr     
 
 def val_meta(args, model, val_loader, device):
     """
@@ -162,7 +231,7 @@ def val_meta(args, model, val_loader, device):
         val_optim = torch.optim.SGD(val_model.parameters(), args.tto_lr)
 
         inner_loop(val_model, val_optim, tto_imgs, tto_poses, hwf,
-                bound, args.num_samples, args.tto_batchsize, args.tto_steps)              
+                    bound, args.num_samples, args.tto_batchsize, args.tto_steps)      
         scene_psnr = report_result(val_model, test_imgs, test_poses, hwf, bound, 
                                     args.num_samples, args.test_batchsize, args.tto_showImages)
         val_psnrs.append(scene_psnr)
@@ -192,6 +261,8 @@ def main():
     # MAML++
     parser.add_argument('--use_scheduler', action='store_true',
                         help='use scheduler to adjust outer loop lr')   
+    parser.add_argument('--checkpoint_path', type=str,
+                        help='path to saved checkpoint')   
                         
     args = parser.parse_args()
     
@@ -199,7 +270,9 @@ def main():
     with open(args.config) as config:
         info = json.load(config)
         for key, value in info.items():
-            args.__dict__[key] = value
+            # don't overwrite the args if exist
+            if args.__dict__[key] is None:
+                args.__dict__[key] = value
             
     print(args)
     use_reptile = args.meta == 'Reptile'
@@ -222,19 +295,13 @@ def main():
     meta_model = build_nerf(args)
     meta_model.to(device)
     
-    if args.resume_step != 0:
-        weight_path = f"{args.checkpoint_path}/step{args.resume_step}.pth"
-        checkpoint = torch.load(weight_path, map_location=device)
-        meta_state = checkpoint['meta_model_state_dict']
-        meta_model.load_state_dict(meta_state)
-
     meta_optim = torch.optim.Adam(meta_model.parameters(), lr=args.meta_lr)
     
     # learn_step_size & per_param_step_size
     step_size = args.inner_lr
     scheduler = None
     if args.use_scheduler:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=meta_optim, T_max=args.max_iters/50, eta_min=args.meta_lr/100)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=meta_optim, T_max=args.max_iters/10, eta_min=args.meta_lr/10)
                                                               
     if args.per_param_step_size:
         step_size = OrderedDict((name, torch.tensor(step_size,
@@ -248,7 +315,17 @@ def main():
     if args.learn_step_size:
         meta_optim.add_param_group({'params': step_size.values()
             if args.per_param_step_size else [step_size]})
-            
+         
+    if args.resume_step != 0:
+        weight_path = f"{args.checkpoint_path}/step{args.resume_step}.pth"
+        checkpoint = torch.load(weight_path, map_location=device)
+        meta_state = checkpoint['meta_model_state_dict']
+        meta_model.load_state_dict(meta_state)
+        step_size = checkpoint['step_size']
+        meta_optim.load_state_dict(checkpoint['meta_optim_state_dict'])
+        
+        print(f"load meta_model_state_dict from {weight_path}")
+        
     step = args.resume_step
     pbar = tqdm(total=args.max_iters, desc = 'Training')
     pbar.update(args.resume_step)
@@ -305,10 +382,27 @@ def main():
             meta_optim.step()
         
             if step % args.val_freq == 0 and step != args.resume_step:
-                if args.meta == 'MAML':
+                if args.meta == 'MAML' and (args.per_param_step_size or args.learn_step_size):
                     train_psnrs.append((step, -10*torch.log10(outer_loss).detach().cpu()))
+                    torch.cuda.empty_cache()
+                    # show one of the validation result
+                    test_psnrs = []
+                    for imgs, poses, hwf, bound in tqdm(val_loader, desc = 'Validating'):
+                        imgs, poses, hwf, bound = imgs.to(device), poses.to(device), hwf.to(device), bound.to(device)
+                        imgs, poses, hwf, bound = imgs.squeeze(), poses.squeeze(), hwf.squeeze(), bound.squeeze()
                 
-                val_psnr = val_meta(args, meta_model, val_loader, device)
+                        tto_imgs, test_imgs = torch.split(imgs, [args.tto_views, args.test_views], dim=0)
+                        tto_poses, test_poses = torch.split(poses, [args.tto_views, args.test_views], dim=0)
+                        
+                        scene_psnr = validate_MAML(meta_model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, step_size, args)            
+                                                    
+                        test_psnrs.append(scene_psnr)
+                
+                    val_psnr = torch.stack(test_psnrs).mean()
+                    
+                else:
+                    val_psnr = val_meta(args, meta_model, val_loader, device, step_size)
+                
                 print(f"step: {step}, val psnr: {val_psnr:0.3f}")
                 val_psnrs.append((step, val_psnr.cpu()))
                 
@@ -323,11 +417,21 @@ def main():
           
             if step % args.checkpoint_freq == 0 and step != args.resume_step:
                 path = f"{args.checkpoint_path}/step{step}.pth"
-                torch.save({
-                    'epoch': step,
-                    'meta_model_state_dict': meta_model.state_dict(),
-                    'meta_optim_state_dict': meta_optim.state_dict(),
-                    }, path)
+                
+                if args.learn_step_size or args.per_param_step_size:
+                    torch.save({
+                        'epoch': step,
+                        'meta_model_state_dict': meta_model.state_dict(),
+                        'meta_optim_state_dict': meta_optim.state_dict(),
+                        'step_size': step_size,
+                        }, path)
+                else:
+                    torch.save({
+                        'epoch': step,
+                        'meta_model_state_dict': meta_model.state_dict(),
+                        'meta_optim_state_dict': meta_optim.state_dict(),
+                        }, path)
+                        
                 print(f"step{step} model save to {path}")
             
             if args.use_scheduler:
