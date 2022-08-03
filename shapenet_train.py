@@ -21,6 +21,7 @@ import gc
 
 from datetime import datetime
 import os
+import numpy as np
 
 def prepare_MAML_data(imgs, poses, batch_size, hwf):
     '''
@@ -52,13 +53,9 @@ def prepare_MAML_data(imgs, poses, batch_size, hwf):
             'target':[target_pixels, target_rays_o, target_rays_d, target_num_rays]
         }
                     
-def MAML_inner_loop(model, bound, num_samples, raybatch_size, inner_steps, alpha, train_data):
-    pixels, rays_o, rays_d, num_rays = train_data['support']
-    target_pixels, target_rays_o, target_rays_d, target_num_rays = train_data['target']
+def MAML_inner_loop(model, bound, num_samples, raybatch_size, inner_steps, alpha, train_data, per_step_loss_importance_vectors=None, first_order=True):
     
-    params = None
-
-    for step in range(inner_steps):
+    def compute_loss(num_rays, raybatch_size, rays_o, rays_d, pixels, num_samples, params):
         indices = torch.randint(num_rays, size=[raybatch_size])
         raybatch_o, raybatch_d = rays_o[indices], rays_d[indices]
         pixelbatch = pixels[indices] 
@@ -68,22 +65,30 @@ def MAML_inner_loop(model, bound, num_samples, raybatch_size, inner_steps, alpha
         rgbs, sigmas = model(xyz, params=params)
         colors = volume_render(rgbs, sigmas, t_vals, white_bkgd=True)
         loss = F.mse_loss(colors, pixelbatch)
-
-        model.zero_grad()
-        params = GUP(model, loss, params=params, step_size=alpha, first_order=True)
+        return loss
         
-    # use the param from previous inner_steps on val views to get a outer loss
-    indices = torch.randint(target_num_rays, size=[raybatch_size])
-    raybatch_o, raybatch_d = target_rays_o[indices], target_rays_d[indices]
-    pixelbatch = target_pixels[indices] 
-    t_vals, xyz = sample_points(raybatch_o, raybatch_d, bound[0], bound[1],
-                                num_samples, perturb=True)
+    pixels, rays_o, rays_d, num_rays = train_data['support']
+    target_pixels, target_rays_o, target_rays_d, target_num_rays = train_data['target']
     
-    rgbs, sigmas = model(xyz, params=params)
-    colors = volume_render(rgbs, sigmas, t_vals, white_bkgd=True)
-    loss = F.mse_loss(colors, pixelbatch)
+    params = None
+    total_losses = []
+    for step in range(inner_steps):
+        loss = compute_loss(num_rays, raybatch_size, rays_o, rays_d, pixels, num_samples, params)
+        model.zero_grad()
+        params = GUP(model, loss, params=params, step_size=alpha, first_order=first_order)
+        
+        if per_step_loss_importance_vectors is not None:
+            loss = compute_loss(target_num_rays, raybatch_size, target_rays_o, target_rays_d, target_pixels, num_samples, params)
+            total_losses.append(per_step_loss_importance_vectors[step] * loss)
+        
+    if per_step_loss_importance_vectors is None:
+        # use the param from previous inner_steps on val views to get a outer loss
+        final_loss = compute_loss(target_num_rays, raybatch_size, target_rays_o, target_rays_d, target_pixels, num_samples, params)
+    else:
+        # use MSL
+        final_loss = torch.sum(torch.stack(total_losses))
              
-    return loss
+    return final_loss
                     
 def inner_loop(model, optim, imgs, poses, hwf, bound, num_samples, raybatch_size, inner_steps):
     """
@@ -175,6 +180,7 @@ def validate_MAML(model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound,
         model.zero_grad()
         # OOM when tto_step>100 as MAML need to backprop to all those step
         # https://github.com/tristandeleu/pytorch-maml/issues/21
+        # always use first order when validating
         params = GUP(model, loss, params=params, step_size=step_size, first_order=True)
         
         
@@ -254,6 +260,29 @@ def val_meta(args, model, val_loader, device, step_size=None):
     return val_psnr
 
 
+def get_per_step_loss_importance_vector(inner_steps, MSL_iterations, current_iteration, device):
+    """
+    Generates a tensor of dimensionality (num_inner_loop_steps) indicating the importance of each step's target
+    loss towards the optimization loss.
+    :param inner_steps: number of inner steps
+    :param MSL_iterations: number of iterations we use MSL
+    :return: A tensor to be used to compute the weighted average of the loss, useful for
+    the MSL (Multi Step Loss) mechanism.
+    """
+    loss_weights = np.ones(shape=(inner_steps)) * (1.0 / inner_steps)
+    decay_rate = 1.0 / inner_steps / MSL_iterations
+    min_value_for_non_final_losses = 0.03 / inner_steps
+    for i in range(len(loss_weights) - 1):
+        curr_value = np.maximum(loss_weights[i] - (current_iteration * decay_rate), min_value_for_non_final_losses)
+        loss_weights[i] = curr_value
+
+    curr_value = np.minimum(
+        loss_weights[-1] + (current_iteration * (inner_steps - 1) * decay_rate),
+        1.0 - ((inner_steps - 1) * min_value_for_non_final_losses))
+    loss_weights[-1] = curr_value
+    loss_weights = torch.Tensor(loss_weights).to(device=device)
+    return loss_weights
+        
 def main():
     parser = argparse.ArgumentParser(description='shapenet few-shot view synthesis')
     parser.add_argument('--config', type=str, required=True,
@@ -366,6 +395,10 @@ def main():
     
             meta_optim.zero_grad()
             
+            per_step_loss_importance_vectors = None
+            if args.use_MSL and step < args.MSL_iterations:
+                per_step_loss_importance_vectors = get_per_step_loss_importance_vector(args.inner_steps, args.MSL_iterations, step, device)
+            
             if use_reptile:
                 inner_model = copy.deepcopy(meta_model)
                 if args.per_param_step_size:
@@ -378,11 +411,11 @@ def main():
                     inner_optim = torch.optim.SGD(params, args.inner_lr)
                 else:
                     inner_optim = torch.optim.SGD(inner_model.parameters(), args.inner_lr)
-        
+                    
                 inner_loop(inner_model, inner_optim, imgs, poses,
                             hwf, bound, args.num_samples,
                             args.train_batchsize, args.inner_steps)
-                            
+
                 # Reptile
                 with torch.no_grad():
                     for meta_param, inner_param in zip(meta_model.parameters(), inner_model.parameters()):
@@ -393,7 +426,7 @@ def main():
                         'inner_lr': step_size['net.1.weight'].item() if args.per_param_step_size else step_size.item(), 
                         "outer_lr" : scheduler.get_last_lr()[0], 
                     })
-            # python shapenet_train.py --config configs/shapenet/chairs.json --meta MAML --learn_step_size --per_param_step_size 
+            # python shapenet_train.py --config configs/shapenet/chairs.json
             # MAML
             # https://github.com/tristandeleu/pytorch-meta/blob/master/examples/maml/train.py
             else:                            
@@ -407,14 +440,19 @@ def main():
                 for i in range(batch_size):
                     # update parameter with the inner loop loss
                     loss = MAML_inner_loop(meta_model, bound, args.num_samples,
-                            args.train_batchsize, args.inner_steps, step_size, train_data)
-                    
+                        args.train_batchsize, args.inner_steps, step_size, train_data,
+                        per_step_loss_importance_vectors,
+                        first_order= not (args.use_second_order and step>args.first_order_to_second_order_iteration))
+                        
                     pbar.set_postfix({
                         'inner_lr': step_size['net.1.weight'].item() if args.per_param_step_size else step_size.item(), 
                         "outer_lr" : scheduler.get_last_lr()[0], 
                         'Train loss': loss.item()
                     })
         
+                    # if per_step_loss_importance_vectors is not None:
+                    #     outer_loss += per_step_loss_importance_vectors[i] * loss
+                    # else:
                     outer_loss += loss
                     
                 meta_optim.zero_grad()
@@ -425,7 +463,7 @@ def main():
         
             if step % args.val_freq == 0 and step != args.resume_step:
                 if args.meta == 'MAML' and (args.per_param_step_size or args.learn_step_size):
-                    train_psnrs.append((step, -10*torch.log10(outer_loss).detach().cpu()))
+                    train_psnrs.append((step, -10*torch.log10(outer_loss).detach().cpu().item()))
                     # show one of the validation result
                     test_psnrs = []
                     for imgs, poses, hwf, bound in tqdm(val_loader, desc = 'Validating'):
@@ -444,7 +482,7 @@ def main():
                     val_psnr = val_meta(args, meta_model, val_loader, device, step_size)
                 
                 print(f"step: {step}, val psnr: {val_psnr:0.3f}")
-                val_psnrs.append((step, val_psnr.cpu()))
+                val_psnrs.append((step, val_psnr.cpu().item()))
                 
                 plt.subplots()
                 plt.plot(*zip(*val_psnrs), label="Meta learning validation PSNR")
@@ -461,12 +499,20 @@ def main():
                     plt.subplots()
                     plt.ylabel("inner learning rate")
                     plt.xlabel("iterations")
-                    plt.title("Change of per parameters inner learning rate")
+                    plt.title("per layers inner learning rate")
                     for (name, lrs) in inner_lrs.items():
                         plt.plot(lrs, label=name)
                     
                     plt.legend()
+                    plt.savefig(f'{args.checkpoint_path}/{step}_lr.png')
                     plt.show()
+                
+                with open(f'{args.checkpoint_path}/psnr.txt', 'w') as f:
+                    psnr = {
+                        'train': train_psnrs,
+                        'val' : val_psnrs
+                    }
+                    f.write(json.dumps(psnr))
           
             if step % args.checkpoint_freq == 0 and step != args.resume_step:
                 path = f"{args.checkpoint_path}/step{step}.pth"
