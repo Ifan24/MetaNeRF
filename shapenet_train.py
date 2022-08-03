@@ -22,6 +22,7 @@ import gc
 from datetime import datetime
 import os
 import numpy as np
+from torchmeta.modules import MetaModule
 
 def prepare_MAML_data(imgs, poses, batch_size, hwf):
     '''
@@ -53,14 +54,18 @@ def prepare_MAML_data(imgs, poses, batch_size, hwf):
             'target':[target_pixels, target_rays_o, target_rays_d, target_num_rays]
         }
                     
-def compute_loss(model, num_rays, raybatch_size, rays_o, rays_d, pixels, num_samples, params, bound):
+def compute_loss(model, num_rays, raybatch_size, rays_o, rays_d, pixels, num_samples, bound, params=None):
     indices = torch.randint(num_rays, size=[raybatch_size])
     raybatch_o, raybatch_d = rays_o[indices], rays_d[indices]
     pixelbatch = pixels[indices] 
     t_vals, xyz = sample_points(raybatch_o, raybatch_d, bound[0], bound[1],
                                 num_samples, perturb=True)
-    
-    rgbs, sigmas = model(xyz, params=params)
+                                
+    if isinstance(model, MetaModule):
+        rgbs, sigmas = model(xyz, params=params)
+    else:
+       rgbs, sigmas = model(xyz)
+
     colors = volume_render(rgbs, sigmas, t_vals, white_bkgd=True)
     loss = F.mse_loss(colors, pixelbatch)
     return loss
@@ -74,17 +79,17 @@ def MAML_inner_loop(model, bound, num_samples, raybatch_size, inner_steps, alpha
     params = None
     total_losses = []
     for step in range(inner_steps):
-        loss = compute_loss(model, num_rays, raybatch_size, rays_o, rays_d, pixels, num_samples, params, bound)
+        loss = compute_loss(model, num_rays, raybatch_size, rays_o, rays_d, pixels, num_samples, bound, params)
         model.zero_grad()
         params = GUP(model, loss, params=params, step_size=alpha, first_order=first_order)
         
         if per_step_loss_importance_vectors is not None:
-            loss = compute_loss(model, target_num_rays, raybatch_size, target_rays_o, target_rays_d, target_pixels, num_samples, params, bound)
+            loss = compute_loss(model, target_num_rays, raybatch_size, target_rays_o, target_rays_d, target_pixels, num_samples, bound, params)
             total_losses.append(per_step_loss_importance_vectors[step] * loss)
         
     if per_step_loss_importance_vectors is None:
         # use the param from previous inner_steps on val views to get a outer loss
-        final_loss = compute_loss(model, target_num_rays, raybatch_size, target_rays_o, target_rays_d, target_pixels, num_samples, params, bound)
+        final_loss = compute_loss(model, target_num_rays, raybatch_size, target_rays_o, target_rays_d, target_pixels, num_samples, bound, params)
     else:
         # use MSL
         final_loss = torch.sum(torch.stack(total_losses))
@@ -181,7 +186,11 @@ def render_and_psnr(model, test_imgs, test_poses, hwf, bound, raybatch_size, num
         num_rays = rays_d.shape[0]
         with torch.no_grad():
             for i in range(0, num_rays, raybatch_size):
-                rgbs_batch, sigmas_batch = model(xyz[i:i+raybatch_size], params=params)
+                if isinstance(model, MetaModule):
+                    rgbs_batch, sigmas_batch = model(xyz[i:i+raybatch_size], params=params)
+                else:
+                    rgbs_batch, sigmas_batch = model(xyz[i:i+raybatch_size])
+                    
                 color_batch = volume_render(rgbs_batch, sigmas_batch, 
                                             t_vals[i:i+raybatch_size],
                                             white_bkgd=True)
@@ -236,44 +245,7 @@ def validate_MAML(model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound,
         
     # use the param from TTO on test imgs
     return render_and_psnr(model, test_imgs, test_poses, hwf, bound, 
-                args.test_batchsize, args.num_samples, args.tto_showImages, params)
-    
-    # ray_origins, ray_directions = get_rays_shapenet(hwf, test_poses)
-    # view_psnrs = []
-    # plt.figure(figsize=(15, 6))
-    # count = 0
-    # raybatch_size = args.test_batchsize
-    # for img, rays_o, rays_d in zip(test_imgs, ray_origins, ray_directions):
-    #     rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
-    #     t_vals, xyz = sample_points(rays_o, rays_d, bound[0], bound[1],
-    #                                 args.num_samples, perturb=False)
-        
-    #     synth = []
-    #     num_rays = rays_d.shape[0]
-    #     with torch.no_grad():
-    #         for i in range(0, num_rays, raybatch_size):
-    #             rgbs_batch, sigmas_batch = model(xyz[i:i+raybatch_size], params=params)
-    #             color_batch = volume_render(rgbs_batch, sigmas_batch, 
-    #                                         t_vals[i:i+raybatch_size],
-    #                                         white_bkgd=True)
-    #             synth.append(color_batch)
-    #         synth = torch.clip(torch.cat(synth, dim=0).reshape_as(img), min=0, max=1)
-    #         error = F.mse_loss(img, synth)
-    #         psnr = -10*torch.log10(error)
-    #         view_psnrs.append(psnr)
-            
-    #         if count < args.tto_showImages:
-    #             plt.subplot(2, 5, count+1)
-    #             plt.imshow(img.cpu())
-    #             plt.title('Target')
-    #             plt.subplot(2,5,count+6)
-    #             plt.imshow(synth.cpu())
-    #             plt.title(f'synth psnr:{psnr:0.2f}')
-    #         count += 1
-            
-    # plt.show()
-    # scene_psnr = torch.stack(view_psnrs).mean()
-    # return scene_psnr     
+                args.test_batchsize, args.num_samples, args.tto_showImages, params)    
 
 def val_meta(args, model, val_loader, device, step_size=None):
     """

@@ -21,116 +21,43 @@ def test_time_optimize(args, model, optim, imgs, poses, hwf, bound):
     inner_loop(model, optim, imgs, poses, hwf, bound, args.num_samples, args.tto_batchsize, args.tto_steps)
 
 
-def train_val_scene(args, model, optim, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound):
+def train_val_scene(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, step_size=0.5):
     """
     train and val the model on available views
     """
     train_val_freq = args.train_val_freq
-    pixels = tto_imgs.reshape(-1, 3)
-
-    tto_rays_o, tto_rays_d = get_rays_shapenet(hwf, tto_poses)
-    tto_rays_o, tto_rays_d = tto_rays_o.reshape(-1, 3), tto_rays_d.reshape(-1, 3)
-
-    test_ray_origins, test_ray_directions = get_rays_shapenet(hwf, test_poses)
-
-    num_samples = args.num_samples
-    tto_showImages = 5    
-
-    num_rays = tto_rays_d.shape[0]
-    val_psnrs = []
-    for step in tqdm(range(args.train_val_steps), desc = 'Train & Validate'):
-        # Get a batch of indices in range of [0, num_rays]
-        indices = torch.randint(num_rays, size=[args.tto_batchsize])
-        raybatch_o, raybatch_d = tto_rays_o[indices], tto_rays_d[indices]
-        pixelbatch = pixels[indices] 
-        t_vals, xyz = sample_points(raybatch_o, raybatch_d, bound[0], bound[1],
-                                    num_samples, perturb=True)
-        
-        optim.zero_grad()
-        rgbs, sigmas = model(xyz)
-        colors = volume_render(rgbs, sigmas, t_vals, white_bkgd=True)
-        loss = F.mse_loss(colors, pixelbatch)
-        loss.backward()
-        optim.step()
-
-        if step % train_val_freq == 0 and step != 0:
-            with torch.no_grad():
-                view_psnrs = []
-                plt.figure(figsize=(15, 6))
-                count = 0
-                
-                for img, rays_o, rays_d in zip(test_imgs, test_ray_origins, test_ray_directions):
-                    rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
-                    t_vals, xyz = sample_points(rays_o, rays_d, bound[0], bound[1],
-                                                num_samples, perturb=False)
-                    
-                    synth = []
-                    test_num_rays = rays_d.shape[0]
-                    for i in range(0, test_num_rays, args.test_batchsize):
-                        rgbs_batch, sigmas_batch = model(xyz[i:i+args.test_batchsize])
-                        color_batch = volume_render(rgbs_batch, sigmas_batch, 
-                                                    t_vals[i:i+args.test_batchsize],
-                                                    white_bkgd=True)
-                        synth.append(color_batch)
-                    
-                    synth = torch.clip(torch.cat(synth, dim=0).reshape_as(img), min=0, max=1)
-                    error = F.mse_loss(img, synth)
-                    psnr = -10*torch.log10(error)
-                    view_psnrs.append(psnr)
-                    
-                    if count < tto_showImages:
-                        plt.subplot(2, 5, count+1)
-                        plt.imshow(img.cpu())
-                        plt.title('Target')
-                        plt.subplot(2,5,count+6)
-                        plt.imshow(synth.cpu())
-                        plt.title(f'{psnr:0.2f}')   
-                    count += 1
-
-                plt.show()
-              
-                plt.figure()
-                scene_psnr = torch.stack(view_psnrs).mean().item()
-                val_psnrs.append((step, scene_psnr))
-                print(f"step: {step}, val psnr: {scene_psnr:0.3f}")
-                plt.plot(*zip(*val_psnrs), label="val_psnr")
-                plt.title(f'ShapeNet Reconstruction from {args.tto_views} views')
-                plt.xlabel('Iterations')
-                plt.ylabel('PSNR')
-                plt.legend()
-                plt.show()
-
-        if step <= 1000:
-            train_val_freq = 100
-        elif step > 1000 and step <= 10000:
-            train_val_freq = 500
-        elif step > 10000 and step <= 50000:
-            train_val_freq = 2500
-        elif step > 50000 and step <= 100000:
-            train_val_freq = 5000
-    print(val_psnrs)
-
-
-def train_val_scene_MAML(args, model, step_size, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound):
-    train_val_freq = args.train_val_freq
-    
-    pixels = tto_imgs.reshape(-1, 3)
     # 25x128x128
+    pixels = tto_imgs.reshape(-1, 3)
     rays_o, rays_d = get_rays_shapenet(hwf, tto_poses)
     rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
     num_rays = rays_d.shape[0]
+
+    if args.per_param_step_size:
+        params = []
+        for (name, param) in model.meta_named_parameters():
+            params.append({
+                'params': param,
+                'lr': step_size[name].item()
+            })
+        print(params)
+        optim = torch.optim.SGD(params, args.tto_lr)
+    else:
+        optim = torch.optim.SGD(model.parameters(), args.tto_lr)
     
-    params = None
     val_psnrs = []
     for step in tqdm(range(args.train_val_steps), desc = 'Train & Validate'):
-        loss = compute_loss(model, num_rays, args.tto_batchsize, rays_o, rays_d, 
-                    pixels, args.num_samples, params, bound)
-        model.zero_grad()
-        params = GUP(model, loss, params=params, step_size=step_size, first_order=True)
+        optim.zero_grad()
+        loss = compute_loss(model=model, num_rays=num_rays, raybatch_size=args.tto_batchsize, 
+                rays_o=rays_o, rays_d=rays_d, pixels=pixels, 
+                num_samples=args.num_samples, bound=bound)
+        loss.backward()
+        optim.step()
+        
         
         if step % train_val_freq == 0 and step != 0:
-            scene_psnr = render_and_psnr(model, test_imgs, test_poses, hwf, bound, 
-                            args.test_batchsize, args.num_samples, args.tto_showImages, params)
+            with torch.no_grad():
+                scene_psnr = render_and_psnr(model, test_imgs, test_poses, hwf, bound, 
+                                args.test_batchsize, args.num_samples, args.tto_showImages)
             val_psnrs.append((step, scene_psnr.item()))
             print(f"step: {step}, val psnr: {scene_psnr:0.3f}")
             plt.plot(*zip(*val_psnrs), label="val_psnr")
@@ -139,7 +66,7 @@ def train_val_scene_MAML(args, model, step_size, tto_imgs, tto_poses, test_imgs,
             plt.ylabel('PSNR')
             plt.legend()
             plt.show()
-            
+
         if step <= 1000:
             train_val_freq = 100
         elif step > 1000 and step <= 10000:
@@ -149,6 +76,60 @@ def train_val_scene_MAML(args, model, step_size, tto_imgs, tto_poses, test_imgs,
         elif step > 50000 and step <= 100000:
             train_val_freq = 5000
     print(val_psnrs)
+
+
+# def train_val_scene_MAML(args, model, step_size, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound):
+#     train_val_freq = args.train_val_freq
+    
+#     # 25x128x128
+#     pixels = tto_imgs.reshape(-1, 3)
+#     rays_o, rays_d = get_rays_shapenet(hwf, tto_poses)
+#     rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
+#     num_rays = rays_d.shape[0]
+    
+#     val_psnrs = []
+#     params = []
+#     for (name, param) in model.meta_named_parameters():
+#         params.append({
+#             'params': param,
+#             'lr': step_size[name].item()
+#         })
+#     print(params)
+#     optim = torch.optim.SGD(params, args.tto_lr)
+    
+#     for step in tqdm(range(args.train_val_steps), desc = 'Train & Validate'):
+        
+#         optim.zero_grad()
+#         loss = compute_loss(model, num_rays, args.tto_batchsize, rays_o, rays_d, 
+#                     pixels, args.num_samples, bound)
+#         loss.backward()
+#         optim.step()
+        
+#         # model.zero_grad()
+#         # params = GUP(model, loss, params=params, step_size=step_size, first_order=True)
+        
+#         if step % train_val_freq == 0 and step != 0:
+#             with torch.no_grad():
+#                 scene_psnr = render_and_psnr(model, test_imgs, test_poses, hwf, bound, 
+#                                 args.test_batchsize, args.num_samples, args.tto_showImages)
+#             val_psnrs.append((step, scene_psnr.item()))
+#             print(f"step: {step}, val psnr: {scene_psnr:0.3f}")
+#             plt.plot(*zip(*val_psnrs), label="val_psnr")
+#             plt.title(f'ShapeNet Reconstruction from {args.tto_views} views')
+#             plt.xlabel('Iterations')
+#             plt.ylabel('PSNR')
+#             plt.legend()
+#             plt.show()
+            
+#         if step <= 1000:
+#             train_val_freq = 100
+#         elif step > 1000 and step <= 10000:
+#             train_val_freq = 500
+#         elif step > 10000 and step <= 50000:
+#             train_val_freq = 2500
+#         elif step > 50000 and step <= 100000:
+#             train_val_freq = 5000
+#     print(val_psnrs)
 
 def test():
     parser = argparse.ArgumentParser(description='shapenet few-shot view synthesis')
@@ -200,8 +181,13 @@ def test():
             if not args.standard_init:
                 model.load_state_dict(meta_state)
                 
-            optim = torch.optim.SGD(model.parameters(), args.tto_lr)
-            train_val_scene(args, model, optim, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound)
+            # if args.per_param_step_size:
+            #     print("testing MAML")
+            #     train_val_scene_MAML(args, model, step_size, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound)
+            # else:
+            #     train_val_scene(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound)
+            train_val_scene(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, step_size)
+            
             return
     
     test_psnrs = []
