@@ -14,8 +14,8 @@
     
     "meta": "MAML",
     "MAML_batch": 5,
-    "learn_step_size": true,
-    "per_param_step_size": true,
+    "learn_inner_lr": true,
+    "per_param_inner_lr": true,
     "use_scheduler": true,
     "scheduler_min_lr": 5e-6,
     "plot_lr": true,

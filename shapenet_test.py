@@ -8,20 +8,18 @@ from datasets.shapenet import build_shapenet
 from models.nerf import build_nerf
 from utils.shape_video import create_360_video
 from models.rendering import get_rays_shapenet, sample_points, volume_render
-from tqdm.notebook import tqdm as tqdm
+try:
+  import google.colab
+  from tqdm.notebook import tqdm as tqdm
+except:
+  from tqdm import tqdm as tqdm
+  
 import matplotlib.pyplot as plt
-from shapenet_train import report_result, inner_loop, validate_MAML, compute_loss, render_and_psnr
+from shapenet_train import validate_MAML, compute_loss, report_result
 from torchmeta.utils.gradient_based import gradient_update_parameters as GUP
 
 
-def test_time_optimize(args, model, optim, imgs, poses, hwf, bound):
-    """
-    test-time-optimize the meta trained model on available views
-    """
-    inner_loop(model, optim, imgs, poses, hwf, bound, args.num_samples, args.tto_batchsize, args.tto_steps)
-
-
-def train_val_scene(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, step_size=0.5):
+def train_val_scene(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, inner_lr=0.5):
     """
     train and val the model on available views
     """
@@ -32,14 +30,13 @@ def train_val_scene(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf
     rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
     num_rays = rays_d.shape[0]
 
-    if args.per_param_step_size:
+    if args.per_param_inner_lr:
         params = []
         for (name, param) in model.meta_named_parameters():
             params.append({
                 'params': param,
-                'lr': step_size[name].item()
+                'lr': inner_lr[name][0].item()
             })
-        print(params)
         optim = torch.optim.SGD(params, args.tto_lr)
     else:
         optim = torch.optim.SGD(model.parameters(), args.tto_lr)
@@ -56,8 +53,10 @@ def train_val_scene(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf
         
         if step % train_val_freq == 0 and step != 0:
             with torch.no_grad():
-                scene_psnr = render_and_psnr(model, test_imgs, test_poses, hwf, bound, 
+                scene_psnr = report_result(model, test_imgs, test_poses, hwf, bound, 
                                 args.test_batchsize, args.num_samples, args.tto_showImages)
+            
+            # Plot validation PSNR
             val_psnrs.append((step, scene_psnr.item()))
             print(f"step: {step}, val psnr: {scene_psnr:0.3f}")
             plt.plot(*zip(*val_psnrs), label="val_psnr")
@@ -77,59 +76,6 @@ def train_val_scene(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf
             train_val_freq = 5000
     print(val_psnrs)
 
-
-# def train_val_scene_MAML(args, model, step_size, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound):
-#     train_val_freq = args.train_val_freq
-    
-#     # 25x128x128
-#     pixels = tto_imgs.reshape(-1, 3)
-#     rays_o, rays_d = get_rays_shapenet(hwf, tto_poses)
-#     rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
-#     num_rays = rays_d.shape[0]
-    
-#     val_psnrs = []
-#     params = []
-#     for (name, param) in model.meta_named_parameters():
-#         params.append({
-#             'params': param,
-#             'lr': step_size[name].item()
-#         })
-#     print(params)
-#     optim = torch.optim.SGD(params, args.tto_lr)
-    
-#     for step in tqdm(range(args.train_val_steps), desc = 'Train & Validate'):
-        
-#         optim.zero_grad()
-#         loss = compute_loss(model, num_rays, args.tto_batchsize, rays_o, rays_d, 
-#                     pixels, args.num_samples, bound)
-#         loss.backward()
-#         optim.step()
-        
-#         # model.zero_grad()
-#         # params = GUP(model, loss, params=params, step_size=step_size, first_order=True)
-        
-#         if step % train_val_freq == 0 and step != 0:
-#             with torch.no_grad():
-#                 scene_psnr = render_and_psnr(model, test_imgs, test_poses, hwf, bound, 
-#                                 args.test_batchsize, args.num_samples, args.tto_showImages)
-#             val_psnrs.append((step, scene_psnr.item()))
-#             print(f"step: {step}, val psnr: {scene_psnr:0.3f}")
-#             plt.plot(*zip(*val_psnrs), label="val_psnr")
-#             plt.title(f'ShapeNet Reconstruction from {args.tto_views} views')
-#             plt.xlabel('Iterations')
-#             plt.ylabel('PSNR')
-#             plt.legend()
-#             plt.show()
-            
-#         if step <= 1000:
-#             train_val_freq = 100
-#         elif step > 1000 and step <= 10000:
-#             train_val_freq = 500
-#         elif step > 10000 and step <= 50000:
-#             train_val_freq = 2500
-#         elif step > 50000 and step <= 100000:
-#             train_val_freq = 5000
-#     print(val_psnrs)
 
 def test():
     parser = argparse.ArgumentParser(description='shapenet few-shot view synthesis')
@@ -161,12 +107,12 @@ def test():
     model = build_nerf(args)
     model.to(device)
 
-    step_size = args.tto_lr
+    inner_lr = args.tto_lr
     if not args.standard_init:
         checkpoint = torch.load(args.weight_path, map_location=device)
         meta_state = checkpoint['meta_model_state_dict']
-        if args.per_param_step_size:
-            step_size = checkpoint['step_size']
+        if args.per_param_inner_lr:
+            inner_lr = checkpoint['inner_lr']
 
     savedir = Path(args.savedir)
     savedir.mkdir(exist_ok=True)
@@ -181,12 +127,7 @@ def test():
             if not args.standard_init:
                 model.load_state_dict(meta_state)
                 
-            # if args.per_param_step_size:
-            #     print("testing MAML")
-            #     train_val_scene_MAML(args, model, step_size, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound)
-            # else:
-            #     train_val_scene(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound)
-            train_val_scene(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, step_size)
+            train_val_scene(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, inner_lr)
             
             return
     
@@ -201,15 +142,8 @@ def test():
         tto_poses, test_poses = torch.split(poses, [args.tto_views, args.test_views], dim=0)
 
         model.load_state_dict(meta_state)
-        if args.per_param_step_size:
-            scene_psnr = validate_MAML(model, tto_imgs, tto_poses, test_imgs, test_poses, 
-                hwf, bound, step_size, args)
-        else:
-            optim = torch.optim.SGD(model.parameters(), args.tto_lr)
-    
-            test_time_optimize(args, model, optim, tto_imgs, tto_poses, hwf, bound)
-            scene_psnr = report_result(model, test_imgs, test_poses, hwf, bound, 
-                                    args.num_samples, args.test_batchsize, args.tto_showImages)
+        scene_psnr = validate_MAML(model, tto_imgs, tto_poses, test_imgs, test_poses, 
+                hwf, bound, inner_lr, args)
         
         if args.create_video:
             create_360_video(args, model, hwf, bound, device, idx+1, savedir)

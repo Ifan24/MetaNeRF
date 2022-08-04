@@ -23,6 +23,29 @@ import os
 import numpy as np
 from torchmeta.modules import MetaModule
 
+def get_per_step_loss_importance_vector(inner_steps, MSL_iterations, current_iteration, device):
+    """
+    Generates a tensor of dimensionality (num_inner_loop_steps) indicating the importance of each step's target
+    loss towards the optimization loss.
+    :param inner_steps: number of inner steps
+    :param MSL_iterations: number of iterations we use MSL
+    :return: A tensor to be used to compute the weighted average of the loss, useful for
+    the MSL (Multi Step Loss) mechanism.
+    """
+    loss_weights = np.ones(shape=(inner_steps)) * (1.0 / inner_steps)
+    decay_rate = 1.0 / inner_steps / MSL_iterations
+    min_value_for_non_final_losses = 0.03 / inner_steps
+    for i in range(len(loss_weights) - 1):
+        curr_value = np.maximum(loss_weights[i] - (current_iteration * decay_rate), min_value_for_non_final_losses)
+        loss_weights[i] = curr_value
+
+    curr_value = np.minimum(
+        loss_weights[-1] + (current_iteration * (inner_steps - 1) * decay_rate),
+        1.0 - ((inner_steps - 1) * min_value_for_non_final_losses))
+    loss_weights[-1] = curr_value
+    loss_weights = torch.Tensor(loss_weights).to(device=device)
+    return loss_weights
+
 def prepare_MAML_data(imgs, poses, batch_size, hwf):
     '''
         split training images to support set and target set
@@ -63,14 +86,13 @@ def compute_loss(model, num_rays, raybatch_size, rays_o, rays_d, pixels, num_sam
     if isinstance(model, MetaModule):
         rgbs, sigmas = model(xyz, params=params)
     else:
-       rgbs, sigmas = model(xyz)
+        rgbs, sigmas = model(xyz)
 
     colors = volume_render(rgbs, sigmas, t_vals, white_bkgd=True)
     loss = F.mse_loss(colors, pixelbatch)
     return loss
     
-    
-def inner_loop_update(model, loss, current_step, params=None, step_size=0.5, first_order=False):
+def inner_loop_update(model, loss, current_step, params=None, inner_lr=0.5, first_order=False):
     if not isinstance(model, MetaModule):
         raise ValueError('The model must be an instance of `torchmeta.modules.'
                          'MetaModule`, got `{0}`'.format(type(model)))
@@ -84,24 +106,23 @@ def inner_loop_update(model, loss, current_step, params=None, step_size=0.5, fir
 
     updated_params = OrderedDict()
 
-    if isinstance(step_size, (dict, OrderedDict)):
+    if isinstance(inner_lr, (dict, OrderedDict)):
         for (name, param), grad in zip(params.items(), grads):
             # validation
-            if current_step > len(step_size[name]):
-                updated_params[name] = param - step_size[name][0] * grad
+            if current_step >= len(inner_lr[name]):
+                updated_params[name] = param - inner_lr[name][0] * grad
             
             # Training
             else:
-                updated_params[name] = param - step_size[name][current_step] * grad
+                updated_params[name] = param - inner_lr[name][current_step] * grad
 
     else:
         for (name, param), grad in zip(params.items(), grads):
-            updated_params[name] = param - step_size * grad
+            updated_params[name] = param - inner_lr * grad
 
     return updated_params
     
-
-def MAML_inner_loop(model, bound, num_samples, raybatch_size, inner_steps, alpha, train_data, per_step_loss_importance_vectors=None, first_order=True):
+def inner_loop(model, bound, num_samples, raybatch_size, inner_steps, inner_lr, train_data, per_step_loss_importance_vectors=None, first_order=True):
     pixels, rays_o, rays_d, num_rays = train_data['support']
     target_pixels, target_rays_o, target_rays_d, target_num_rays = train_data['target']
     
@@ -110,9 +131,9 @@ def MAML_inner_loop(model, bound, num_samples, raybatch_size, inner_steps, alpha
     for step in range(inner_steps):
         loss = compute_loss(model, num_rays, raybatch_size, rays_o, rays_d, pixels, num_samples, bound, params)
         model.zero_grad()
-        # params = GUP(model, loss, params=params, step_size=alpha, first_order=first_order)
+        # params = GUP(model, loss, params=params, step_size=inner_lr, first_order=first_order)
         params = inner_loop_update(model, loss, current_step=step, params=params, 
-                                    step_size=alpha, first_order=first_order)
+                                    inner_lr=inner_lr, first_order=first_order)
         
         if per_step_loss_importance_vectors is not None:
             loss = compute_loss(model, target_num_rays, raybatch_size, target_rays_o, target_rays_d, target_pixels, num_samples, bound, params)
@@ -127,72 +148,7 @@ def MAML_inner_loop(model, bound, num_samples, raybatch_size, inner_steps, alpha
              
     return final_loss
                     
-def inner_loop(model, optim, imgs, poses, hwf, bound, num_samples, raybatch_size, inner_steps):
-    """
-    train the inner model for a specified number of iterations
-    """
-    pixels = imgs.reshape(-1, 3)
-
-    rays_o, rays_d = get_rays_shapenet(hwf, poses)
-    rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
-
-    num_rays = rays_d.shape[0]
-    for step in range(inner_steps):
-        indices = torch.randint(num_rays, size=[raybatch_size])
-        raybatch_o, raybatch_d = rays_o[indices], rays_d[indices]
-        pixelbatch = pixels[indices] 
-        t_vals, xyz = sample_points(raybatch_o, raybatch_d, bound[0], bound[1],
-                                    num_samples, perturb=True)
-        
-        optim.zero_grad()
-        rgbs, sigmas = model(xyz)
-        colors = volume_render(rgbs, sigmas, t_vals, white_bkgd=True)
-        loss = F.mse_loss(colors, pixelbatch)
-        loss.backward()
-        optim.step()
-    
-def report_result(model, imgs, poses, hwf, bound, num_samples, raybatch_size, tto_showImages):
-    """
-    report view-synthesis result on heldout views
-    """
-    ray_origins, ray_directions = get_rays_shapenet(hwf, poses)
-    view_psnrs = []
-    plt.figure(figsize=(15, 6))
-    count = 0
-    for img, rays_o, rays_d in zip(imgs, ray_origins, ray_directions):
-        rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
-        t_vals, xyz = sample_points(rays_o, rays_d, bound[0], bound[1],
-                                    num_samples, perturb=False)
-        
-        synth = []
-        num_rays = rays_d.shape[0]
-        with torch.no_grad():
-            for i in range(0, num_rays, raybatch_size):
-                rgbs_batch, sigmas_batch = model(xyz[i:i+raybatch_size])
-                color_batch = volume_render(rgbs_batch, sigmas_batch, 
-                                            t_vals[i:i+raybatch_size],
-                                            white_bkgd=True)
-                synth.append(color_batch)
-            synth = torch.clip(torch.cat(synth, dim=0).reshape_as(img), min=0, max=1)
-            error = F.mse_loss(img, synth)
-            psnr = -10*torch.log10(error)
-            view_psnrs.append(psnr)
-            
-            if count < tto_showImages:
-                plt.subplot(2, 5, count+1)
-                plt.imshow(img.cpu())
-                plt.title('Target')
-                plt.subplot(2,5,count+6)
-                plt.imshow(synth.cpu())
-                plt.title(f'synth psnr:{psnr:0.2f}')
-            count += 1
-            
-    plt.show()
-    scene_psnr = torch.stack(view_psnrs).mean()
-    return scene_psnr
-
-
-def render_and_psnr(model, test_imgs, test_poses, hwf, bound, raybatch_size, num_samples, tto_showImages, params=None):
+def report_result(model, test_imgs, test_poses, hwf, bound, raybatch_size, num_samples, tto_showImages, params=None):
     """
         render images in test_poses and compute the PSNR against the test_imgs
         using the params as the model weight if provided, if not then use the model weight
@@ -244,7 +200,7 @@ def render_and_psnr(model, test_imgs, test_poses, hwf, bound, raybatch_size, num
     scene_psnr = torch.stack(view_psnrs).mean()
     return scene_psnr  
     
-def validate_MAML(model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, step_size, args):
+def validate_MAML(model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, inner_lr, args):
     '''
         train and report the result of model
     '''
@@ -257,91 +213,31 @@ def validate_MAML(model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound,
     params = None
     
     for step in range(args.tto_steps):
-        indices = torch.randint(num_rays, size=[args.tto_batchsize])
-        raybatch_o, raybatch_d = rays_o[indices], rays_d[indices]
-        pixelbatch = pixels[indices] 
-        t_vals, xyz = sample_points(raybatch_o, raybatch_d, bound[0], bound[1],
-                                    args.num_samples, perturb=True)
+        loss = compute_loss(model, num_rays, args.tto_batchsize, rays_o, rays_d, pixels, args.num_samples, bound, params)
         
-        rgbs, sigmas = model(xyz, params=params)
-        colors = volume_render(rgbs, sigmas, t_vals, white_bkgd=True)
-        loss = F.mse_loss(colors, pixelbatch)
+        # indices = torch.randint(num_rays, size=[args.tto_batchsize])
+        # raybatch_o, raybatch_d = rays_o[indices], rays_d[indices]
+        # pixelbatch = pixels[indices] 
+        # t_vals, xyz = sample_points(raybatch_o, raybatch_d, bound[0], bound[1],
+        #                             args.num_samples, perturb=True)
+        
+        # rgbs, sigmas = model(xyz, params=params)
+        # colors = volume_render(rgbs, sigmas, t_vals, white_bkgd=True)
+        # loss = F.mse_loss(colors, pixelbatch)
 
         model.zero_grad()
         # OOM when tto_step>100 as MAML need to backprop to all those step
         # https://github.com/tristandeleu/pytorch-maml/issues/21
         # always use first order when validating
         
-        # TODO:
-        # convert per inner step step-size to the first step
-        # params = GUP(model, loss, params=params, step_size=step_size, first_order=True)
+        # params = GUP(model, loss, params=params, step_size=inner_lr, first_order=True)
         params = inner_loop_update(model, loss, current_step=step, params=params, 
-                                    step_size=step_size, first_order=True)
+                                    inner_lr=inner_lr, first_order=True)
         
     # use the param from TTO on test imgs
-    return render_and_psnr(model, test_imgs, test_poses, hwf, bound, 
+    return report_result(model, test_imgs, test_poses, hwf, bound, 
                 args.test_batchsize, args.num_samples, args.tto_showImages, params)    
 
-def val_meta(args, model, val_loader, device, step_size=None):
-    """
-    validate the meta trained model for few-shot view synthesis
-    """
-    meta_trained_state = model.state_dict()
-    val_model = copy.deepcopy(model)
-    # show one of the validation result
-    val_psnrs = []
-    for imgs, poses, hwf, bound in tqdm(val_loader, desc = 'Validating'):
-        imgs, poses, hwf, bound = imgs.to(device), poses.to(device), hwf.to(device), bound.to(device)
-        imgs, poses, hwf, bound = imgs.squeeze(), poses.squeeze(), hwf.squeeze(), bound.squeeze()
-
-        tto_imgs, test_imgs = torch.split(imgs, [args.tto_views, args.test_views], dim=0)
-        tto_poses, test_poses = torch.split(poses, [args.tto_views, args.test_views], dim=0)
-
-        val_model.load_state_dict(meta_trained_state)
-        
-        if args.per_param_step_size:
-            params = []
-            for (name, param) in val_model.meta_named_parameters():
-                params.append({
-                    'params': param,
-                    'lr': step_size[name].item()
-                })
-            val_optim = torch.optim.SGD(params, args.tto_lr)
-        else:
-            val_optim = torch.optim.SGD(val_model.parameters(), args.tto_lr)
-
-        inner_loop(val_model, val_optim, tto_imgs, tto_poses, hwf,
-                    bound, args.num_samples, args.tto_batchsize, args.tto_steps)      
-        scene_psnr = report_result(val_model, test_imgs, test_poses, hwf, bound, 
-                                    args.num_samples, args.test_batchsize, args.tto_showImages)
-        val_psnrs.append(scene_psnr)
-
-    val_psnr = torch.stack(val_psnrs).mean()
-    return val_psnr
-
-
-def get_per_step_loss_importance_vector(inner_steps, MSL_iterations, current_iteration, device):
-    """
-    Generates a tensor of dimensionality (num_inner_loop_steps) indicating the importance of each step's target
-    loss towards the optimization loss.
-    :param inner_steps: number of inner steps
-    :param MSL_iterations: number of iterations we use MSL
-    :return: A tensor to be used to compute the weighted average of the loss, useful for
-    the MSL (Multi Step Loss) mechanism.
-    """
-    loss_weights = np.ones(shape=(inner_steps)) * (1.0 / inner_steps)
-    decay_rate = 1.0 / inner_steps / MSL_iterations
-    min_value_for_non_final_losses = 0.03 / inner_steps
-    for i in range(len(loss_weights) - 1):
-        curr_value = np.maximum(loss_weights[i] - (current_iteration * decay_rate), min_value_for_non_final_losses)
-        loss_weights[i] = curr_value
-
-    curr_value = np.minimum(
-        loss_weights[-1] + (current_iteration * (inner_steps - 1) * decay_rate),
-        1.0 - ((inner_steps - 1) * min_value_for_non_final_losses))
-    loss_weights[-1] = curr_value
-    loss_weights = torch.Tensor(loss_weights).to(device=device)
-    return loss_weights
 
 # python shapenet_train.py --config configs/shapenet/chairs.json
 def main():
@@ -355,11 +251,11 @@ def main():
     parser.add_argument('--MAML_batch', type=int, default=3,
                         help='number of batch of task for MAML')
     # Meta-SGD
-    parser.add_argument('--learn_step_size', action='store_true',
-                        help='the step size is a learnable (meta-trained) additional argument')
+    parser.add_argument('--learn_inner_lr', action='store_true',
+                        help='the inner lr is a learnable (meta-trained) additional argument')
     # Meta-SGD
-    parser.add_argument('--per_param_step_size', action='store_true',
-                        help='the step size parameter is different for each parameter of the model. Has no impact unless `learn_step_size=True')
+    parser.add_argument('--per_param_inner_lr', action='store_true',
+                        help='the inner lr parameter is different for each parameter of the model. Has no impact unless `learn_inner_lr=True')
     # MAML++
     parser.add_argument('--use_scheduler', action='store_true',
                         help='use scheduler to adjust outer loop lr')   
@@ -368,7 +264,9 @@ def main():
     parser.add_argument('--make_checkpoint_dir', action='store_true',
                         help='make a directory in checkpoint_path with name as current time')
     parser.add_argument('--plot_lr', action='store_true',
-                        help='plot inner learning rates')                 
+                        help='plot inner learning rates')      
+    parser.add_argument('--load_meta_init', type=str, default="random",
+                        help='start meta training with an initialization')  
     args = parser.parse_args()
     
     with open(args.config) as config:
@@ -411,53 +309,58 @@ def main():
     meta_model = build_nerf(args)
     meta_model.to(device)
     
+    if args.load_meta_init != 'random':
+        checkpoint = torch.load(args.load_meta_init, map_location=device)
+        meta_state = checkpoint['meta_model_state_dict']
+        meta_model.load_state_dict(meta_state)
+        print(f"load meta_model_state_dict from {args.load_meta_init}")
+    
     meta_optim = torch.optim.Adam(meta_model.parameters(), lr=args.meta_lr)
     
-    # learnable step size & per_param_step_size
+    # learnable inner_lr & per_param_inner_lr
     # ============================
-    step_size = args.inner_lr
+    inner_lr = args.inner_lr
     scheduler = None
     if args.use_scheduler:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=meta_optim, T_max=args.max_iters, eta_min=args.scheduler_min_lr)
                                                           
     # log the first layer's per step learning rate
-    inner_per_step_lr = [[] for _ in range(args.inner_steps+1)]
+    inner_per_step_lr = [[] for _ in range(args.inner_steps)]
     for (name, param) in meta_model.meta_named_parameters():
         first_layer_name = name
         break
     
-    if args.per_param_step_size:
-        # for logging the step size
-        inner_step_sizes = OrderedDict((name, [step_size]) for (name, param)
+    if args.per_param_inner_lr:
+        # for logging the inner lr
+        inner_lrs = OrderedDict((name, [inner_lr]) for (name, param)
             in meta_model.meta_named_parameters())
         
-        # for each step and each layer, create a learnable step size (LSLR)
-        init_step_size = torch.ones(args.inner_steps+1, dtype=param.dtype) * step_size
-        init_step_size.to(device)
-        step_size = OrderedDict()
-        for (name, param) in meta_model.meta_named_parameters():
-            step_size[name] = init_step_size.clone().detach().requires_grad_(args.learn_step_size).to(device)
+        # for each step and each layer, create a learnable inner lr (LSLR)
+        init_inner_lr = torch.ones(args.inner_steps, dtype=param.dtype) * inner_lr
+        init_inner_lr.to(device)
+        # inner_lr = OrderedDict()
+        # for (name, param) in meta_model.meta_named_parameters():
+        #     inner_lr[name] = init_inner_lr.clone().detach().requires_grad_(args.learn_inner_lr).to(device)
             
-        # step_size = OrderedDict((name,
-        #     torch.tensor(init_step_size, 
-        #     dtype=param.dtype, 
-        #     device=device,
-        #     requires_grad=args.learn_step_size)) 
-        #     for (name, param) in meta_model.meta_named_parameters())
+        inner_lr = OrderedDict((name,
+            torch.tensor(init_inner_lr, 
+            dtype=param.dtype, 
+            device=device,
+            requires_grad=args.learn_inner_lr)) 
+            for (name, param) in meta_model.meta_named_parameters())
         
     else:
-        step_size = torch.tensor(step_size, dtype=torch.float32,
-            device=device, requires_grad=args.learn_step_size)
+        inner_lr = torch.tensor(inner_lr, dtype=torch.float32,
+            device=device, requires_grad=args.learn_inner_lr)
             
-    if args.learn_step_size:
-        if args.per_param_step_size:
-            meta_optim.add_param_group({'params': step_size.values()})
+    if args.learn_inner_lr:
+        if args.per_param_inner_lr:
+            meta_optim.add_param_group({'params': inner_lr.values()})
         else:
-            meta_optim.add_param_group({'params': [step_size]})
+            meta_optim.add_param_group({'params': [inner_lr]})
             
-        # a list of tensor
-        # meta_optim.add_param_group({'params': step_size.values()
-        #     if args.per_param_step_size else [step_size]})
+        # meta_optim.add_param_group({'params': inner_lr.values()
+        #     if args.per_param_inner_lr else [inner_lr]})
     # ============================
 
     if args.resume_step != 0:
@@ -465,7 +368,7 @@ def main():
         checkpoint = torch.load(weight_path, map_location=device)
         meta_state = checkpoint['meta_model_state_dict']
         meta_model.load_state_dict(meta_state)
-        step_size = checkpoint['step_size']
+        inner_lr = checkpoint['inner_lr']
         meta_optim.load_state_dict(checkpoint['meta_optim_state_dict'])
         
         print(f"load meta_model_state_dict from {weight_path}")
@@ -481,8 +384,6 @@ def main():
             imgs, poses, hwf, bound = imgs.to(device), poses.to(device), hwf.to(device), bound.to(device)
             imgs, poses, hwf, bound = imgs.squeeze(), poses.squeeze(), hwf.squeeze(), bound.squeeze()
     
-            meta_optim.zero_grad()
-            
             per_step_loss_importance_vectors = None
             if args.use_MSL and step < args.MSL_iterations:
                 per_step_loss_importance_vectors = get_per_step_loss_importance_vector(args.inner_steps, args.MSL_iterations, step, device)
@@ -498,19 +399,18 @@ def main():
             # should it be a batch of scenes? or a batch of pixels in a single scene
             for i in range(batch_size):
                 # update parameter with the inner loop loss
-                loss = MAML_inner_loop(meta_model, bound, args.num_samples,
-                    args.train_batchsize, args.inner_steps, step_size, train_data,
+                loss = inner_loop(meta_model, bound, args.num_samples,
+                    args.train_batchsize, args.inner_steps, inner_lr, train_data,
                     per_step_loss_importance_vectors=per_step_loss_importance_vectors,
                     first_order= not (args.use_second_order and step>args.first_order_to_second_order_iteration))
                     
-                pbar.set_postfix({
-                    'inner_lr': step_size['net.1.weight'][0].item() if args.per_param_step_size else step_size.item(), 
-                    "outer_lr" : scheduler.get_last_lr()[0], 
-                    'Train loss': loss.item()
-                })
-    
                 outer_loss += loss
                 
+            pbar.set_postfix({
+                'inner_lr': inner_lr['net.1.weight'][0].item() if args.per_param_inner_lr else inner_lr.item(), 
+                "outer_lr" : scheduler.get_last_lr()[0], 
+                'Train loss': loss.item()
+            })
             meta_optim.zero_grad()
             outer_loss.div_(batch_size)
             outer_loss.backward()
@@ -528,7 +428,7 @@ def main():
                     tto_imgs, test_imgs = torch.split(imgs, [args.tto_views, args.test_views], dim=0)
                     tto_poses, test_poses = torch.split(poses, [args.tto_views, args.test_views], dim=0)
                     
-                    scene_psnr = validate_MAML(meta_model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, step_size, args)            
+                    scene_psnr = validate_MAML(meta_model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, inner_lr, args)            
                                                 
                     test_psnrs.append(scene_psnr)
             
@@ -553,12 +453,25 @@ def main():
                     plt.ylabel("inner learning rate")
                     plt.xlabel("iterations")
                     plt.title("per layers inner learning rate")
-                    for (name, lrs) in inner_step_sizes.items():
+                    for (name, lrs) in inner_lrs.items():
                         plt.plot(lrs, label=name)
                     
                     plt.legend()
                     plt.savefig(f'{args.checkpoint_path}/{step}_lr.png')
                     plt.show()
+                    
+                    # ===================
+                    plt.subplots()
+                    plt.ylabel("per step learning rate")
+                    plt.xlabel("iterations")
+                    plt.title(f"per layers per steps inner learning rate for layer {first_layer_name}")
+                    for (idx, lrs) in enumerate(inner_per_step_lr):
+                        plt.plot(lrs, label=f"inner step {idx}")
+                    
+                    plt.legend()
+                    plt.savefig(f'{args.checkpoint_path}/{step}_per_steps_lr.png')
+                    plt.show()
+                    
                 
                 with open(f'{args.checkpoint_path}/psnr.txt', 'w') as f:
                     psnr = {
@@ -574,7 +487,7 @@ def main():
                     'epoch': step,
                     'meta_model_state_dict': meta_model.state_dict(),
                     'meta_optim_state_dict': meta_optim.state_dict(),
-                    'step_size': step_size,
+                    'inner_lr': inner_lr,
                     }, path)
                         
                 print(f"step{step} model save to {path}")
@@ -584,13 +497,10 @@ def main():
                 
                 if args.plot_lr:
                     for (name, param) in meta_model.meta_named_parameters():
-                        inner_step_sizes[name].append(step_size[name][0].item())
+                        inner_lrs[name].append(inner_lr[name][0].item())
                     
                     for idx, lr_list in enumerate(inner_per_step_lr):
-                        lr_list.append(step_size[first_layer_name][idx].item())
-                    # print(inner_per_step_lr)
-                    
-                    
+                        lr_list.append(inner_lr[first_layer_name][idx].item())
                 
             step += 1
             pbar.update(1)
