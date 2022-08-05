@@ -238,6 +238,8 @@ def validate_MAML(model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound,
     return report_result(model, test_imgs, test_poses, hwf, bound, 
                 args.test_batchsize, args.num_samples, args.tto_showImages, params)    
 
+def to_int(float_tensor, clamp_min=0, clamp_max=32):
+    return int(torch.clamp(float_tensor, clamp_min, clamp_max).item())
 
 # python shapenet_train.py --config configs/shapenet/chairs.json
 def main():
@@ -319,13 +321,23 @@ def main():
     
     # learnable inner_lr & per_param_inner_lr
     # ============================
+    inner_steps = torch.tensor(args.inner_steps, 
+        dtype=torch.float, 
+        device=device,
+        requires_grad=args.learn_inner_step)
+    # print(to_int(inner_steps, args.inner_steps_min, args.inner_steps_max))
+    log_inner_steps = [inner_steps.item()]
+    if args.learn_inner_step:
+        meta_optim.add_param_group({'params': [inner_steps]})
+    
     inner_lr = args.inner_lr
     scheduler = None
     if args.use_scheduler:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=meta_optim, T_max=args.max_iters, eta_min=args.scheduler_min_lr)
                                                           
     # log the first layer's per step learning rate
-    inner_per_step_lr = [[] for _ in range(args.inner_steps)]
+    inner_per_step_lr = [[] for _ in range(args.inner_steps_max if args.learn_inner_step else args.inner_steps)]
+    
     for (name, param) in meta_model.meta_named_parameters():
         first_layer_name = name
         break
@@ -336,7 +348,7 @@ def main():
             in meta_model.meta_named_parameters())
         
         # for each step and each layer, create a learnable inner lr (LSLR)
-        init_inner_lr = torch.ones(args.inner_steps, dtype=param.dtype) * inner_lr
+        init_inner_lr = torch.ones(args.inner_steps_max if args.learn_inner_step else args.inner_steps) * inner_lr
         init_inner_lr.to(device)
         # inner_lr = OrderedDict()
         # for (name, param) in meta_model.meta_named_parameters():
@@ -351,14 +363,14 @@ def main():
         
     else:
         inner_lr = torch.tensor(inner_lr, dtype=torch.float32,
-            device=device, requires_grad=args.learn_inner_lr)
-            
+            device=device, requires_grad=args.learn_inner_lr)        
+        
     if args.learn_inner_lr:
         if args.per_param_inner_lr:
             meta_optim.add_param_group({'params': inner_lr.values()})
         else:
             meta_optim.add_param_group({'params': [inner_lr]})
-            
+                
         # meta_optim.add_param_group({'params': inner_lr.values()
         #     if args.per_param_inner_lr else [inner_lr]})
     # ============================
@@ -386,7 +398,8 @@ def main():
     
             per_step_loss_importance_vectors = None
             if args.use_MSL and step < args.MSL_iterations:
-                per_step_loss_importance_vectors = get_per_step_loss_importance_vector(args.inner_steps, args.MSL_iterations, step, device)
+                per_step_loss_importance_vectors = get_per_step_loss_importance_vector(
+                            to_int(inner_steps, args.inner_steps_min, args.inner_steps_max), args.MSL_iterations, step, device)
             
             
             # https://github.com/tristandeleu/pytorch-meta/blob/master/examples/maml/train.py
@@ -400,7 +413,7 @@ def main():
             for i in range(batch_size):
                 # update parameter with the inner loop loss
                 loss = inner_loop(meta_model, bound, args.num_samples,
-                    args.train_batchsize, args.inner_steps, inner_lr, train_data,
+                    args.train_batchsize, to_int(inner_steps, args.inner_steps_min, args.inner_steps_max), inner_lr, train_data,
                     per_step_loss_importance_vectors=per_step_loss_importance_vectors,
                     first_order= not (args.use_second_order and step>args.first_order_to_second_order_iteration))
                     
@@ -472,11 +485,23 @@ def main():
                     plt.savefig(f'{args.checkpoint_path}/{step}_per_steps_lr.png')
                     plt.show()
                     
+                    # ===================
+                    plt.subplots()
+                    plt.ylabel("inner steps")
+                    plt.xlabel("iterations")
+                    plt.title(f"Changes of learned inner steps")
+                    plt.plot(log_inner_steps)
+                    
+                    plt.legend()
+                    plt.savefig(f'{args.checkpoint_path}/{step}_inner_steps.png')
+                    plt.show()
+                    
                 
                 with open(f'{args.checkpoint_path}/psnr.txt', 'w') as f:
                     psnr = {
                         'train': train_psnrs,
-                        'val' : val_psnrs
+                        'val' : val_psnrs,
+                        'best_val': sorted(val_psnrs,key=lambda x: x[1], reverse=True)[0]
                     }
                     f.write(json.dumps(psnr))
           
@@ -501,6 +526,8 @@ def main():
                     
                     for idx, lr_list in enumerate(inner_per_step_lr):
                         lr_list.append(inner_lr[first_layer_name][idx].item())
+                    
+                    log_inner_steps.append(inner_steps.item())
                 
             step += 1
             pbar.update(1)
