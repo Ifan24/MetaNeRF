@@ -396,42 +396,46 @@ def main():
             imgs, poses, hwf, bound = imgs.to(device), poses.to(device), hwf.to(device), bound.to(device)
             imgs, poses, hwf, bound = imgs.squeeze(), poses.squeeze(), hwf.squeeze(), bound.squeeze()
     
-            per_step_loss_importance_vectors = None
-            if args.use_MSL and step < args.MSL_iterations:
-                per_step_loss_importance_vectors = get_per_step_loss_importance_vector(
-                            to_int(inner_steps, args.inner_steps_min, args.inner_steps_max), args.MSL_iterations, step, device)
-            
-            
-            # https://github.com/tristandeleu/pytorch-meta/blob/master/examples/maml/train.py
-            outer_loss = torch.tensor(0.).to(device)
-            batch_size = args.MAML_batch
-            train_data = prepare_MAML_data(imgs, poses, batch_size, hwf)
-                                
-            # In MAML, the losses of a batch tasks were used to update meta parameter 
-            # but the batch of tasks in NeRF does not makes too much sense
-            # should it be a batch of scenes? or a batch of pixels in a single scene
-            for i in range(batch_size):
-                # update parameter with the inner loop loss
-                loss = inner_loop(meta_model, bound, args.num_samples,
-                    args.train_batchsize, to_int(inner_steps, args.inner_steps_min, args.inner_steps_max), inner_lr, train_data,
-                    per_step_loss_importance_vectors=per_step_loss_importance_vectors,
-                    first_order= not (args.use_second_order and step>args.first_order_to_second_order_iteration))
-                    
-                outer_loss += loss
+            # for each scene, run multiple stages
+            for _ in range(args.MAML_stage):
+                per_step_loss_importance_vectors = None
+                if args.use_MSL and step < args.MSL_iterations:
+                    per_step_loss_importance_vectors = get_per_step_loss_importance_vector(
+                                to_int(inner_steps, args.inner_steps_min, args.inner_steps_max), args.MSL_iterations, step, device)
                 
-            pbar.set_postfix({
-                'inner_lr': inner_lr['net.1.weight'][0].item() if args.per_param_inner_lr else inner_lr.item(), 
-                "outer_lr" : scheduler.get_last_lr()[0], 
-                'Train loss': loss.item()
-            })
-            meta_optim.zero_grad()
-            outer_loss.div_(batch_size)
-            outer_loss.backward()
-        
-            meta_optim.step()
+                
+                # https://github.com/tristandeleu/pytorch-meta/blob/master/examples/maml/train.py
+                outer_loss = torch.tensor(0.).to(device)
+                batch_size = args.MAML_batch
+                train_data = prepare_MAML_data(imgs, poses, batch_size, hwf)
+                                    
+                # In MAML, the losses of a batch tasks were used to update meta parameter 
+                # but the batch of tasks in NeRF does not makes too much sense
+                # should it be a batch of scenes? or a batch of pixels in a single scene
+                for i in range(batch_size):
+                    # update parameter with the inner loop loss
+                    loss = inner_loop(meta_model, bound, args.num_samples,
+                        args.train_batchsize, to_int(inner_steps, args.inner_steps_min, args.inner_steps_max), inner_lr, train_data,
+                        per_step_loss_importance_vectors=per_step_loss_importance_vectors,
+                        first_order= not (args.use_second_order and step>args.first_order_to_second_order_iteration))
+                        
+                    outer_loss += loss
+                    
+                pbar.set_postfix({
+                    'inner_lr': inner_lr['net.1.weight'][0].item() if args.per_param_inner_lr else inner_lr.item(), 
+                    "outer_lr" : scheduler.get_last_lr()[0], 
+                    'Train loss': loss.item()
+                })
+                meta_optim.zero_grad()
+                outer_loss.div_(batch_size)
+                outer_loss.backward()
+            
+                meta_optim.step()
+                # after step, optimizer will update inner per step learning rate and inner step
+                # it makes more sense to use the same scene to get a new loss for the updated params
+                train_psnrs.append((step, -10*torch.log10(outer_loss).detach().cpu().item()))
         
             if step % args.val_freq == 0 and step != args.resume_step:
-                train_psnrs.append((step, -10*torch.log10(outer_loss).detach().cpu().item()))
                 # show one of the validation result
                 test_psnrs = []
                 for imgs, poses, hwf, bound in tqdm(val_loader, desc = 'Validating'):
