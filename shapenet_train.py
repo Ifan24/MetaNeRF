@@ -46,35 +46,49 @@ def get_per_step_loss_importance_vector(inner_steps, MSL_iterations, current_ite
     loss_weights = torch.Tensor(loss_weights).to(device=device)
     return loss_weights
 
-def prepare_MAML_data(imgs, poses, batch_size, hwf):
+def prepare_MAML_data(imgs, poses, batch_size, hwf, raybatch_size):
     '''
-        split training images to support set and target set
-        size(support set) = train_views - MAML_batch_size
-        size(target set) = MAML_batch_size
+        divided data into batches with len batch_size
+        and in each chunk split training images to support set and target set
+        size(support set) = train_pixels - raybatch_size
+        size(target set) = raybatch_size
     '''
-    # shuffle the images
+    
+    def prepare_batch(imgs, poses, raybatch_size, hwf):
+        pixels = imgs.reshape(-1, 3)
+        # 25x128x128
+        rays_o, rays_d = get_rays_shapenet(hwf, poses)
+        rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
+        
+        # shuffle the pixels
+        indexes = torch.randperm(pixels.shape[0])
+        pixels = pixels[indexes]
+        rays_o = rays_o[indexes]
+        rays_d = rays_d[indexes]
+        
+        target_pixels, target_rays_o, target_rays_d = pixels[:raybatch_size], rays_o[:raybatch_size], rays_d[:raybatch_size]
+        pixels, rays_o, rays_d = pixels[raybatch_size:], rays_o[raybatch_size:], rays_d[raybatch_size:]
+        
+        target_num_rays = target_rays_d.shape[0]
+        num_rays = rays_d.shape[0]
+        
+        return {
+                'support': [pixels, rays_o, rays_d, num_rays], 
+                'target':[target_pixels, target_rays_o, target_rays_d, target_num_rays]
+            }
+    
     indexes = torch.randperm(imgs.shape[0])
     imgs = imgs[indexes]
     poses = poses[indexes]
     
-    target_imgs, target_poses = imgs[:batch_size], poses[:batch_size]
-    imgs, poses = imgs[batch_size:], poses[batch_size:] 
+    imgs_chunk = imgs.chunk(batch_size)
+    poses_chunk = poses.chunk(batch_size)
     
-    pixels = imgs.reshape(-1, 3)
-    # 25x128x128
-    rays_o, rays_d = get_rays_shapenet(hwf, poses)
-    rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
-    num_rays = rays_d.shape[0]
+    batches = []
+    for i in range(batch_size):
+        batches.append(prepare_batch(imgs_chunk[i], poses_chunk[i], raybatch_size, hwf))
+    return batches
     
-    target_pixels = target_imgs.reshape(-1, 3)
-    target_rays_o, target_rays_d = get_rays_shapenet(hwf, target_poses)
-    target_rays_o, target_rays_d = target_rays_o.reshape(-1, 3), target_rays_d.reshape(-1, 3)
-    target_num_rays = target_rays_d.shape[0]
-    
-    return {
-            'support': [pixels, rays_o, rays_d, num_rays], 
-            'target':[target_pixels, target_rays_o, target_rays_d, target_num_rays]
-        }
                     
 def compute_loss(model, num_rays, raybatch_size, rays_o, rays_d, pixels, num_samples, bound, params=None):
     indices = torch.randint(num_rays, size=[raybatch_size])
@@ -238,7 +252,7 @@ def validate_MAML(model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound,
     return report_result(model, test_imgs, test_poses, hwf, bound, 
                 args.test_batchsize, args.num_samples, args.tto_showImages, params)    
 
-def to_int(float_tensor, clamp_min=0, clamp_max=32):
+def to_int(float_tensor, clamp_min=1, clamp_max=32):
     return int(torch.clamp(float_tensor, clamp_min, clamp_max).item())
 
 # python shapenet_train.py --config configs/shapenet/chairs.json
@@ -319,23 +333,25 @@ def main():
     
     meta_optim = torch.optim.Adam(meta_model.parameters(), lr=args.meta_lr)
     
-    # learnable inner_lr & per_param_inner_lr
-    # ============================
+    scheduler = None
+    if args.use_scheduler:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=meta_optim, T_max=args.max_iters, eta_min=args.scheduler_min_lr)
+        
     inner_steps = torch.tensor(args.inner_steps, 
-        dtype=torch.float, 
+        dtype=torch.float32, 
         device=device,
         requires_grad=args.learn_inner_step)
+
     # print(to_int(inner_steps, args.inner_steps_min, args.inner_steps_max))
+    # TODO: not working 
     log_inner_steps = [inner_steps.item()]
     if args.learn_inner_step:
         meta_optim.add_param_group({'params': [inner_steps]})
     
-    inner_lr = args.inner_lr
-    scheduler = None
-    if args.use_scheduler:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=meta_optim, T_max=args.max_iters, eta_min=args.scheduler_min_lr)
-                                                          
+    # learnable inner_lr & per_param_inner_lr
+    # ============================
     # log the first layer's per step learning rate
+    inner_lr = args.inner_lr
     inner_per_step_lr = [[] for _ in range(args.inner_steps_max if args.learn_inner_step else args.inner_steps)]
     
     for (name, param) in meta_model.meta_named_parameters():
@@ -384,7 +400,9 @@ def main():
         meta_optim.load_state_dict(checkpoint['meta_optim_state_dict'])
         
         print(f"load meta_model_state_dict from {weight_path}")
-        
+    
+    # print(meta_optim.param_groups)
+    
     step = args.resume_step
     pbar = tqdm(total=args.max_iters, desc = 'Training')
     pbar.update(args.resume_step)
@@ -396,7 +414,7 @@ def main():
             imgs, poses, hwf, bound = imgs.to(device), poses.to(device), hwf.to(device), bound.to(device)
             imgs, poses, hwf, bound = imgs.squeeze(), poses.squeeze(), hwf.squeeze(), bound.squeeze()
     
-            # for each scene, run multiple stages
+            # TODO: for each scene, run multiple stages (not sure how it does)
             for _ in range(args.MAML_stage):
                 per_step_loss_importance_vectors = None
                 if args.use_MSL and step < args.MSL_iterations:
@@ -407,7 +425,7 @@ def main():
                 # https://github.com/tristandeleu/pytorch-meta/blob/master/examples/maml/train.py
                 outer_loss = torch.tensor(0.).to(device)
                 batch_size = args.MAML_batch
-                train_data = prepare_MAML_data(imgs, poses, batch_size, hwf)
+                train_data = prepare_MAML_data(imgs, poses, batch_size, hwf, args.train_batchsize)
                                     
                 # In MAML, the losses of a batch tasks were used to update meta parameter 
                 # but the batch of tasks in NeRF does not makes too much sense
@@ -415,7 +433,7 @@ def main():
                 for i in range(batch_size):
                     # update parameter with the inner loop loss
                     loss = inner_loop(meta_model, bound, args.num_samples,
-                        args.train_batchsize, to_int(inner_steps, args.inner_steps_min, args.inner_steps_max), inner_lr, train_data,
+                        args.train_batchsize, to_int(inner_steps, args.inner_steps_min, args.inner_steps_max), inner_lr, train_data[i],
                         per_step_loss_importance_vectors=per_step_loss_importance_vectors,
                         first_order= not (args.use_second_order and step>args.first_order_to_second_order_iteration))
                         
@@ -433,9 +451,9 @@ def main():
                 meta_optim.step()
                 # after step, optimizer will update inner per step learning rate and inner step
                 # it makes more sense to use the same scene to get a new loss for the updated params
-                train_psnrs.append((step, -10*torch.log10(outer_loss).detach().cpu().item()))
         
             if step % args.val_freq == 0 and step != args.resume_step:
+                train_psnrs.append((step, -10*torch.log10(outer_loss).detach().cpu().item()))
                 # show one of the validation result
                 test_psnrs = []
                 for imgs, poses, hwf, bound in tqdm(val_loader, desc = 'Validating'):
@@ -466,39 +484,40 @@ def main():
                 print(val_psnrs)
                 
                 if args.plot_lr:
-                    plt.subplots()
-                    plt.ylabel("inner learning rate")
-                    plt.xlabel("iterations")
-                    plt.title("per layers inner learning rate")
-                    for (name, lrs) in inner_lrs.items():
-                        plt.plot(lrs, label=name)
-                    
-                    plt.legend()
-                    plt.savefig(f'{args.checkpoint_path}/{step}_lr.png')
-                    plt.show()
-                    
-                    # ===================
-                    plt.subplots()
-                    plt.ylabel("per step learning rate")
-                    plt.xlabel("iterations")
-                    plt.title(f"per layers per steps inner learning rate for layer {first_layer_name}")
-                    for (idx, lrs) in enumerate(inner_per_step_lr):
-                        plt.plot(lrs, label=f"inner step {idx}")
-                    
-                    plt.legend()
-                    plt.savefig(f'{args.checkpoint_path}/{step}_per_steps_lr.png')
-                    plt.show()
+                    if args.per_param_inner_lr:
+                        plt.subplots()
+                        plt.ylabel("inner learning rate")
+                        plt.xlabel("iterations")
+                        plt.title("per layers inner learning rate")
+                        for (name, lrs) in inner_lrs.items():
+                            plt.plot(lrs, label=name)
+                        
+                        plt.legend()
+                        plt.savefig(f'{args.checkpoint_path}/{step}_lr.png')
+                        plt.show()
                     
                     # ===================
-                    plt.subplots()
-                    plt.ylabel("inner steps")
-                    plt.xlabel("iterations")
-                    plt.title(f"Changes of learned inner steps")
-                    plt.plot(log_inner_steps)
                     
-                    plt.legend()
-                    plt.savefig(f'{args.checkpoint_path}/{step}_inner_steps.png')
-                    plt.show()
+                        plt.subplots()
+                        plt.ylabel("per step learning rate")
+                        plt.xlabel("iterations")
+                        plt.title(f"per layers per steps inner learning rate for layer {first_layer_name}")
+                        for (idx, lrs) in enumerate(inner_per_step_lr):
+                            plt.plot(lrs, label=f"inner step {idx}")
+                        
+                        plt.legend()
+                        plt.savefig(f'{args.checkpoint_path}/{step}_per_steps_lr.png')
+                        plt.show()
+                    
+                    # ===================
+                    if args.learn_inner_steps:
+                        plt.subplots()
+                        plt.ylabel("inner steps")
+                        plt.xlabel("iterations")
+                        plt.title(f"Changes of learned inner steps")
+                        plt.plot(log_inner_steps)
+                        plt.savefig(f'{args.checkpoint_path}/{step}_inner_steps.png')
+                        plt.show()
                     
                 
                 with open(f'{args.checkpoint_path}/psnr.txt', 'w') as f:
