@@ -50,8 +50,7 @@ def train_val_scene(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf
         loss.backward()
         optim.step()
         
-        
-        if step % train_val_freq == 0 and step != 0:
+        if step % train_val_freq == 0:
             with torch.no_grad():
                 scene_psnr = report_result(model, test_imgs, test_poses, hwf, bound, 
                                 args.test_batchsize, args.num_samples, args.tto_showImages)

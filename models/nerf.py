@@ -53,7 +53,8 @@ class MetaSimpleNeRF(MetaModule):
         self.net = []
         self.net.append(PositionalEncoding(max_freq, num_freqs))
         self.net.append(MetaLinear(2*num_freqs*in_features, hidden_features))
-        self.net.append(nn.ReLU())
+        # TODO: an extra ReLU??
+        # self.net.append(nn.ReLU())
     
         for i in range(hidden_layers-1):
             self.net.append(MetaLinear(hidden_features, hidden_features))
@@ -73,7 +74,9 @@ class MetaSimpleNeRF(MetaModule):
         """
         out = self.net(x, params=self.get_subdict(params, 'net'))
         rgb = torch.sigmoid(out[..., :-1])
-        sigma = F.softplus(out[..., -1])
+        # sigma = F.softplus(out[..., -1])
+        # original paper use relu here
+        sigma = F.relu(out[..., -1])
         return rgb, sigma
 
 

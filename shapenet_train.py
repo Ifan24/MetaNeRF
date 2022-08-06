@@ -510,7 +510,7 @@ def main():
                         plt.show()
                     
                     # ===================
-                    if args.learn_inner_steps:
+                    if args.learn_inner_step:
                         plt.subplots()
                         plt.ylabel("inner steps")
                         plt.xlabel("iterations")
