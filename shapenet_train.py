@@ -46,47 +46,45 @@ def get_per_step_loss_importance_vector(inner_steps, MSL_iterations, current_ite
     loss_weights = torch.Tensor(loss_weights).to(device=device)
     return loss_weights
 
-def prepare_MAML_data(imgs, poses, batch_size, hwf, raybatch_size):
+    
+def prepare_MAML_data(imgs, poses, batch_size, hwf, device):
     '''
         divided data into batches with len batch_size
         and in each chunk split training images to support set and target set
         size(support set) = train_pixels - raybatch_size
         size(target set) = raybatch_size
     '''
+    # takes 1 view as target set
+    # assume the MAML batch < 128 and training view > 1
     
-    def prepare_batch(imgs, poses, raybatch_size, hwf):
-        pixels = imgs.reshape(-1, 3)
-        # 25x128x128
-        rays_o, rays_d = get_rays_shapenet(hwf, poses)
-        rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
-        
-        # shuffle the pixels
-        indexes = torch.randperm(pixels.shape[0])
-        pixels = pixels[indexes]
-        rays_o = rays_o[indexes]
-        rays_d = rays_d[indexes]
-        
-        target_pixels, target_rays_o, target_rays_d = pixels[:raybatch_size], rays_o[:raybatch_size], rays_d[:raybatch_size]
-        pixels, rays_o, rays_d = pixels[raybatch_size:], rays_o[raybatch_size:], rays_d[raybatch_size:]
-        
-        target_num_rays = target_rays_d.shape[0]
-        num_rays = rays_d.shape[0]
-        
-        return {
-                'support': [pixels, rays_o, rays_d, num_rays], 
-                'target':[target_pixels, target_rays_o, target_rays_d, target_num_rays]
-            }
-    
+    # shuffle the images
     indexes = torch.randperm(imgs.shape[0])
     imgs = imgs[indexes]
     poses = poses[indexes]
     
-    imgs_chunk = imgs.chunk(batch_size)
-    poses_chunk = poses.chunk(batch_size)
+    target_imgs = imgs[0]
+    target_poses = poses[0]
     
+    imgs = imgs[1:]
+    poses = poses[1:]
+    
+    def shuffle_pixels(imgs, poses):
+        pixels = imgs.reshape(-1, 3)
+        rays_o, rays_d = get_rays_shapenet(hwf, poses)
+        rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
+        indexes = torch.randperm(pixels.shape[0])
+        return pixels[indexes].chunk(batch_size), rays_o[indexes].chunk(batch_size), rays_d[indexes].chunk(batch_size)
+        
+    pixels, rays_o, rays_d = shuffle_pixels(imgs, poses)
+    target_pixels, target_rays_o, target_rays_d = shuffle_pixels(target_imgs, target_poses)
     batches = []
     for i in range(batch_size):
-        batches.append(prepare_batch(imgs_chunk[i], poses_chunk[i], raybatch_size, hwf))
+        train_data = {
+                'support': [pixels[i].to(device), rays_o[i].to(device), rays_d[i].to(device), pixels[i].shape[0]],
+                'target':[target_pixels[i].to(device), target_rays_o[i].to(device), target_rays_d[i].to(device), target_pixels[i].shape[0]]
+        }
+        batches.append(train_data)
+        
     return batches
     
                     
@@ -413,7 +411,7 @@ def main():
             # imgs = [1, train_views(25), H(128), W(128), C(3)]
             imgs, poses, hwf, bound = imgs.to(device), poses.to(device), hwf.to(device), bound.to(device)
             imgs, poses, hwf, bound = imgs.squeeze(), poses.squeeze(), hwf.squeeze(), bound.squeeze()
-    
+            print(imgs.is_cuda)
             # TODO: for each scene, run multiple stages (not sure how it does)
             for _ in range(args.MAML_stage):
                 per_step_loss_importance_vectors = None
@@ -425,7 +423,7 @@ def main():
                 # https://github.com/tristandeleu/pytorch-meta/blob/master/examples/maml/train.py
                 outer_loss = torch.tensor(0.).to(device)
                 batch_size = args.MAML_batch
-                train_data = prepare_MAML_data(imgs, poses, batch_size, hwf, args.train_batchsize)
+                train_data = prepare_MAML_data(imgs, poses, batch_size, hwf, device)
                                     
                 # In MAML, the losses of a batch tasks were used to update meta parameter 
                 # but the batch of tasks in NeRF does not makes too much sense
@@ -450,7 +448,7 @@ def main():
             
                 meta_optim.step()
                 # after step, optimizer will update inner per step learning rate and inner step
-                # it makes more sense to use the same scene to get a new loss for the updated params
+                # it makes more sense to use the same scene to get a new loss for the updated hyper params
         
             if step % args.val_freq == 0 and step != args.resume_step:
                 train_psnrs.append((step, -10*torch.log10(outer_loss).detach().cpu().item()))
