@@ -250,8 +250,25 @@ def validate_MAML(model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound,
     return report_result(model, test_imgs, test_poses, hwf, bound, 
                 args.test_batchsize, args.num_samples, args.tto_showImages, params)    
 
-def to_int(float_tensor, clamp_min=1, clamp_max=32):
-    return int(torch.clamp(float_tensor, clamp_min, clamp_max).item())
+# based on the past N task to update the inner steps
+def update_inner_steps(task_difficulty, min_steps=1, max_steps=16, cache_size=100):
+    # only keep track of last N task
+    
+    last_task = task_difficulty[len(task_difficulty)-1]
+    current_task = task_difficulty[-cache_size:]
+    current_task.sort()
+    difficulty_rank = current_task.index(last_task)
+    # difficulty_rank is in range of (0, cache_size)
+    
+    def remap(x, in_min, in_max, out_min, out_max):
+        return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+    
+    new_inner_steps = remap(difficulty_rank, 0, cache_size, min_steps, max_steps)
+    return int(new_inner_steps), difficulty_rank
+        
+    
+# def to_int(float_tensor, clamp_min=1, clamp_max=32):
+#     return int(torch.clamp(float_tensor, clamp_min, clamp_max).item())
 
 # python shapenet_train.py --config configs/shapenet/chairs.json
 def main():
@@ -335,16 +352,18 @@ def main():
     if args.use_scheduler:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=meta_optim, T_max=args.max_iters, eta_min=args.scheduler_min_lr)
         
-    inner_steps = torch.tensor(args.inner_steps, 
-        dtype=torch.float32, 
-        device=device,
-        requires_grad=args.learn_inner_step)
-
+    # inner_steps = torch.tensor(args.inner_steps, 
+    #     dtype=torch.float32, 
+    #     device=device,
+    #     requires_grad=args.learn_inner_step)
+    inner_steps = args.inner_steps
+    
     # print(to_int(inner_steps, args.inner_steps_min, args.inner_steps_max))
     # TODO: not working 
-    log_inner_steps = [inner_steps.item()]
-    if args.learn_inner_step:
-        meta_optim.add_param_group({'params': [inner_steps]})
+    log_inner_steps = [inner_steps]
+    log_difficulty_rank = []
+    # if args.learn_inner_step:
+    #     meta_optim.add_param_group({'params': [inner_steps]})
     
     # learnable inner_lr & per_param_inner_lr
     # ============================
@@ -364,16 +383,16 @@ def main():
         # for each step and each layer, create a learnable inner lr (LSLR)
         init_inner_lr = torch.ones(args.inner_steps_max if args.learn_inner_step else args.inner_steps) * inner_lr
         init_inner_lr.to(device)
-        # inner_lr = OrderedDict()
-        # for (name, param) in meta_model.meta_named_parameters():
-        #     inner_lr[name] = init_inner_lr.clone().detach().requires_grad_(args.learn_inner_lr).to(device)
+        inner_lr = OrderedDict()
+        for (name, param) in meta_model.meta_named_parameters():
+            inner_lr[name] = init_inner_lr.clone().detach().requires_grad_(args.learn_inner_lr).to(device)
             
-        inner_lr = OrderedDict((name,
-            torch.tensor(init_inner_lr, 
-            dtype=param.dtype, 
-            device=device,
-            requires_grad=args.learn_inner_lr)) 
-            for (name, param) in meta_model.meta_named_parameters())
+        # inner_lr = OrderedDict((name,
+        #     torch.tensor(init_inner_lr, 
+        #     dtype=param.dtype, 
+        #     device=device,
+        #     requires_grad=args.learn_inner_lr)) 
+        #     for (name, param) in meta_model.meta_named_parameters())
         
     else:
         inner_lr = torch.tensor(inner_lr, dtype=torch.float32,
@@ -406,18 +425,19 @@ def main():
     pbar.update(args.resume_step)
     val_psnrs = []
     train_psnrs = []
+    task_difficulty = []
     while step < args.max_iters:
         for imgs, poses, hwf, bound in train_loader:                    
             # imgs = [1, train_views(25), H(128), W(128), C(3)]
             imgs, poses, hwf, bound = imgs.to(device), poses.to(device), hwf.to(device), bound.to(device)
             imgs, poses, hwf, bound = imgs.squeeze(), poses.squeeze(), hwf.squeeze(), bound.squeeze()
-            print(imgs.is_cuda)
             # TODO: for each scene, run multiple stages (not sure how it does)
             for _ in range(args.MAML_stage):
                 per_step_loss_importance_vectors = None
+                # task_inner_steps = to_int(inner_steps, args.inner_steps_min, args.inner_steps_max)
                 if args.use_MSL and step < args.MSL_iterations:
                     per_step_loss_importance_vectors = get_per_step_loss_importance_vector(
-                                to_int(inner_steps, args.inner_steps_min, args.inner_steps_max), args.MSL_iterations, step, device)
+                                inner_steps, args.MSL_iterations, step, device)
                 
                 
                 # https://github.com/tristandeleu/pytorch-meta/blob/master/examples/maml/train.py
@@ -431,7 +451,7 @@ def main():
                 for i in range(batch_size):
                     # update parameter with the inner loop loss
                     loss = inner_loop(meta_model, bound, args.num_samples,
-                        args.train_batchsize, to_int(inner_steps, args.inner_steps_min, args.inner_steps_max), inner_lr, train_data[i],
+                        args.train_batchsize, inner_steps, inner_lr, train_data[i],
                         per_step_loss_importance_vectors=per_step_loss_importance_vectors,
                         first_order= not (args.use_second_order and step>args.first_order_to_second_order_iteration))
                         
@@ -447,6 +467,13 @@ def main():
                 outer_loss.backward()
             
                 meta_optim.step()
+                
+                task_difficulty.append(outer_loss.item()) 
+                if step >= args.difficulty_size and args.learn_inner_step:
+                    inner_steps, difficulty_rank = update_inner_steps(task_difficulty, args.inner_steps_min, args.inner_steps_max, args.difficulty_size)
+                    log_difficulty_rank.append(difficulty_rank)
+                    log_inner_steps.append(inner_steps)
+                    
                 # after step, optimizer will update inner per step learning rate and inner step
                 # it makes more sense to use the same scene to get a new loss for the updated hyper params
         
@@ -510,12 +537,16 @@ def main():
                     # ===================
                     if args.learn_inner_step:
                         plt.subplots()
-                        plt.ylabel("inner steps")
+                        plt.ylabel("inner steps/difficulty rank")
                         plt.xlabel("iterations")
-                        plt.title(f"Changes of learned inner steps")
-                        plt.plot(log_inner_steps)
+                        plt.title(f"learned inner steps and difficulty")
+                        plt.plot(log_inner_steps, label=f"inner steps ({args.inner_steps_min} to {args.inner_steps_max})")
+                        plt.plot(log_difficulty_rank, label=f"difficulty rank (0 to {args.difficulty_size})")
+                        
                         plt.savefig(f'{args.checkpoint_path}/{step}_inner_steps.png')
                         plt.show()
+                        
+                        
                     
                 
                 with open(f'{args.checkpoint_path}/psnr.txt', 'w') as f:
@@ -547,9 +578,7 @@ def main():
                     
                     for idx, lr_list in enumerate(inner_per_step_lr):
                         lr_list.append(inner_lr[first_layer_name][idx].item())
-                    
-                    log_inner_steps.append(inner_steps.item())
-                
+                                    
             step += 1
             pbar.update(1)
             
