@@ -383,16 +383,16 @@ def main():
         # for each step and each layer, create a learnable inner lr (LSLR)
         init_inner_lr = torch.ones(args.inner_steps_max if args.learn_inner_step else args.inner_steps) * inner_lr
         init_inner_lr.to(device)
-        inner_lr = OrderedDict()
-        for (name, param) in meta_model.meta_named_parameters():
-            inner_lr[name] = init_inner_lr.clone().detach().requires_grad_(args.learn_inner_lr).to(device)
+        # inner_lr = OrderedDict()
+        # for (name, param) in meta_model.meta_named_parameters():
+        #     inner_lr[name] = init_inner_lr.clone().detach().requires_grad_(args.learn_inner_lr).to(device)
             
-        # inner_lr = OrderedDict((name,
-        #     torch.tensor(init_inner_lr, 
-        #     dtype=param.dtype, 
-        #     device=device,
-        #     requires_grad=args.learn_inner_lr)) 
-        #     for (name, param) in meta_model.meta_named_parameters())
+        inner_lr = OrderedDict((name,
+            torch.tensor(init_inner_lr, 
+            dtype=param.dtype, 
+            device=device,
+            requires_grad=args.learn_inner_lr)) 
+            for (name, param) in meta_model.meta_named_parameters())
         
     else:
         inner_lr = torch.tensor(inner_lr, dtype=torch.float32,
@@ -456,12 +456,13 @@ def main():
                         first_order= not (args.use_second_order and step>args.first_order_to_second_order_iteration))
                         
                     outer_loss += loss
-                    
-                pbar.set_postfix({
-                    'inner_lr': inner_lr['net.1.weight'][0].item() if args.per_param_inner_lr else inner_lr.item(), 
-                    "outer_lr" : scheduler.get_last_lr()[0], 
-                    'Train loss': loss.item()
-                })
+                  
+                if args.per_param_inner_lr: 
+                    pbar.set_postfix({
+                        'inner_lr': inner_lr['net.1.weight'][0].item(), 
+                        "outer_lr" : scheduler.get_last_lr()[0], 
+                        'Train loss': loss.item()
+                    })
                 meta_optim.zero_grad()
                 outer_loss.div_(batch_size)
                 outer_loss.backward()
@@ -471,8 +472,9 @@ def main():
                 task_difficulty.append(outer_loss.item()) 
                 if step >= args.difficulty_size and args.learn_inner_step:
                     inner_steps, difficulty_rank = update_inner_steps(task_difficulty, args.inner_steps_min, args.inner_steps_max, args.difficulty_size)
-                    log_difficulty_rank.append(difficulty_rank)
-                    log_inner_steps.append(inner_steps)
+                    if step % 10 == 0:
+                        log_difficulty_rank.append(difficulty_rank)
+                        log_inner_steps.append(inner_steps)
                     
                 # after step, optimizer will update inner per step learning rate and inner step
                 # it makes more sense to use the same scene to get a new loss for the updated hyper params
@@ -537,16 +539,21 @@ def main():
                     # ===================
                     if args.learn_inner_step:
                         plt.subplots()
-                        plt.ylabel("inner steps/difficulty rank")
+                        plt.ylabel("inner steps")
                         plt.xlabel("iterations")
-                        plt.title(f"learned inner steps and difficulty")
-                        plt.plot(log_inner_steps, label=f"inner steps ({args.inner_steps_min} to {args.inner_steps_max})")
-                        plt.plot(log_difficulty_rank, label=f"difficulty rank (0 to {args.difficulty_size})")
-                        
+                        plt.title(f"adaptive inner steps ({args.inner_steps_min} to {args.inner_steps_max})")
+                        plt.plot(log_inner_steps)
                         plt.savefig(f'{args.checkpoint_path}/{step}_inner_steps.png')
                         plt.show()
                         
                         
+                        plt.subplots()
+                        plt.ylabel("difficulty_rank")
+                        plt.xlabel("iterations")
+                        plt.title(f"difficulty_rank (0 to {args.difficulty_size})")
+                        plt.plot(log_difficulty_rank)
+                        plt.savefig(f'{args.checkpoint_path}/{step}_difficulty_rank.png')
+                        plt.show()
                     
                 
                 with open(f'{args.checkpoint_path}/psnr.txt', 'w') as f:
