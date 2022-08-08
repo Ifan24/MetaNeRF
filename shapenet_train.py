@@ -271,10 +271,30 @@ def update_inner_steps(task_difficulty, min_steps=1, max_steps=16, cache_size=10
     
     new_inner_steps = remap(difficulty_rank, 0, cache_size, min_steps, max_steps)
     return int(new_inner_steps), difficulty_rank
+     
+def inner_loop_Reptile(model, optim, imgs, poses, hwf, bound, num_samples, raybatch_size, inner_steps):
+    """
+    train the inner model for a specified number of iterations
+    """
+    pixels = imgs.reshape(-1, 3)
+
+    rays_o, rays_d = get_rays_shapenet(hwf, poses)
+    rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
+
+    num_rays = rays_d.shape[0]
+    for step in range(inner_steps):
+        indices = torch.randint(num_rays, size=[raybatch_size])
+        raybatch_o, raybatch_d = rays_o[indices], rays_d[indices]
+        pixelbatch = pixels[indices] 
+        t_vals, xyz = sample_points(raybatch_o, raybatch_d, bound[0], bound[1],
+                                    num_samples, perturb=True)
         
-    
-# def to_int(float_tensor, clamp_min=1, clamp_max=32):
-#     return int(torch.clamp(float_tensor, clamp_min, clamp_max).item())
+        optim.zero_grad()
+        rgbs, sigmas = model(xyz)
+        colors = volume_render(rgbs, sigmas, t_vals, white_bkgd=True)
+        loss = F.mse_loss(colors, pixelbatch)
+        loss.backward()
+        optim.step()
 
 # python shapenet_train.py --config configs/shapenet/chairs.json
 def main():
@@ -358,14 +378,8 @@ def main():
     if args.use_scheduler:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=meta_optim, T_max=args.max_iters, eta_min=args.scheduler_min_lr)
         
-    # inner_steps = torch.tensor(args.inner_steps, 
-    #     dtype=torch.float32, 
-    #     device=device,
-    #     requires_grad=args.learn_inner_step)
     inner_steps = args.inner_steps
     
-    # print(to_int(inner_steps, args.inner_steps_min, args.inner_steps_max))
-    # TODO: not working 
     log_inner_steps = [inner_steps]
     log_difficulty_rank = []
     # if args.learn_inner_step:
@@ -438,57 +452,82 @@ def main():
             imgs, poses, hwf, bound = imgs.to(device), poses.to(device), hwf.to(device), bound.to(device)
             imgs, poses, hwf, bound = imgs.squeeze(), poses.squeeze(), hwf.squeeze(), bound.squeeze()
             # TODO: for each scene, run multiple stages (not sure how it does)
-            for _ in range(args.MAML_stage):
-                per_step_loss_importance_vectors = None
-                # task_inner_steps = to_int(inner_steps, args.inner_steps_min, args.inner_steps_max)
-                if args.use_MSL and step < args.MSL_iterations:
-                    per_step_loss_importance_vectors = get_per_step_loss_importance_vector(
-                                inner_steps, args.MSL_iterations, step, device)
-                
-                
-                # https://github.com/tristandeleu/pytorch-meta/blob/master/examples/maml/train.py
-                outer_loss = torch.tensor(0.).to(device)
-                batch_size = args.MAML_batch
-                train_data = prepare_MAML_data(imgs, poses, batch_size, hwf, device)
-                                    
-                # In MAML, the losses of a batch tasks were used to update meta parameter 
-                # but the batch of tasks in NeRF does not makes too much sense
-                # should it be a batch of scenes? or a batch of pixels in a single scene
-                for i in range(batch_size):
-                    # update parameter with the inner loop loss
-                    loss = inner_loop(meta_model, bound, args.num_samples,
-                        args.train_batchsize, inner_steps, inner_lr, train_data[i],
-                        per_step_loss_importance_vectors=per_step_loss_importance_vectors,
-                        first_order= not (args.use_second_order and step>args.first_order_to_second_order_iteration))
-                        
-                    outer_loss += loss
-                  
-                if args.per_param_inner_lr: 
-                    pbar.set_postfix({
-                        'inner_lr': inner_lr['net.1.weight'][0].item(), 
-                        "outer_lr" : scheduler.get_last_lr()[0], 
-                        'Train loss': loss.item()
-                    })
-                meta_optim.zero_grad()
-                outer_loss.div_(batch_size)
-                outer_loss.backward()
-            
-                meta_optim.step()
-                
-                task_difficulty.append(outer_loss.item()) 
-                if step >= args.difficulty_size and args.learn_inner_step:
-                    inner_steps, difficulty_rank = update_inner_steps(task_difficulty, args.inner_steps_min, args.inner_steps_max, args.difficulty_size)
-                    if step % 10 == 0:
-                        log_difficulty_rank.append(difficulty_rank)
-                        log_inner_steps.append(inner_steps)
-                    
+            if args.meta == 'MAML':
                 # after step, optimizer will update inner per step learning rate and inner step
                 # it makes more sense to use the same scene to get a new loss for the updated hyper params
+                for _ in range(args.MAML_stage):
+                    per_step_loss_importance_vectors = None
+                    # task_inner_steps = to_int(inner_steps, args.inner_steps_min, args.inner_steps_max)
+                    if args.use_MSL and step < args.MSL_iterations:
+                        per_step_loss_importance_vectors = get_per_step_loss_importance_vector(
+                                    inner_steps, args.MSL_iterations, step, device)
+                    
+                    
+                    # https://github.com/tristandeleu/pytorch-meta/blob/master/examples/maml/train.py
+                    outer_loss = torch.tensor(0.).to(device)
+                    batch_size = args.MAML_batch
+                    train_data = prepare_MAML_data(imgs, poses, batch_size, hwf, device)
+                                        
+                    # In MAML, the losses of a batch tasks were used to update meta parameter 
+                    # but the batch of tasks in NeRF does not makes too much sense
+                    # should it be a batch of scenes? or a batch of pixels in a single scene
+                    for i in range(batch_size):
+                        # update parameter with the inner loop loss
+                        loss = inner_loop(meta_model, bound, args.num_samples,
+                            args.train_batchsize, inner_steps, inner_lr, train_data[i],
+                            per_step_loss_importance_vectors=per_step_loss_importance_vectors,
+                            first_order= not (args.use_second_order and step>args.first_order_to_second_order_iteration))
+                            
+                        outer_loss += loss
+                      
+                    if args.per_param_inner_lr: 
+                        pbar.set_postfix({
+                            'inner_lr': inner_lr['net.1.weight'][0].item(), 
+                            "outer_lr" : scheduler.get_last_lr()[0], 
+                            'Train loss': loss.item()
+                        })
+                    meta_optim.zero_grad()
+                    outer_loss.div_(batch_size)
+                    outer_loss.backward()
+                
+                    meta_optim.step()
+                    
+                    task_difficulty.append(outer_loss.item()) 
+                    if step >= args.difficulty_size and args.learn_inner_step:
+                        inner_steps, difficulty_rank = update_inner_steps(task_difficulty, args.inner_steps_min, args.inner_steps_max, args.difficulty_size)
+                        if step % 10 == 0:
+                            log_difficulty_rank.append(difficulty_rank)
+                            log_inner_steps.append(inner_steps)
+            
+            else:
+                meta_optim.zero_grad()
+    
+                inner_model = copy.deepcopy(meta_model)
+                inner_optim = torch.optim.SGD(inner_model.parameters(), args.inner_lr)
+        
+                inner_loop_Reptile(inner_model, inner_optim, imgs, poses,
+                            hwf, bound, args.num_samples,
+                            args.train_batchsize, args.inner_steps)
+                            
+                # Reptile
+                with torch.no_grad():
+                    for meta_param, inner_param in zip(meta_model.parameters(), inner_model.parameters()):
+                        meta_param.grad = meta_param - inner_param
+                
+                meta_optim.step()
+                        
+
         
             if step % args.val_freq == 0 and step != args.resume_step:
-                train_psnrs.append((step, -10*torch.log10(outer_loss).detach().cpu().item()))
                 # show one of the validation result
                 test_psnrs = []
+                if args.meta == 'MAML':
+                    train_psnrs.append((step, -10*torch.log10(outer_loss).detach().cpu().item()))
+                else:
+                    meta_trained_state = meta_model.state_dict()
+                    val_model = copy.deepcopy(meta_model)
+                
+                
                 for imgs, poses, hwf, bound in tqdm(val_loader, desc = 'Validating'):
                     imgs, poses, hwf, bound = imgs.to(device), poses.to(device), hwf.to(device), bound.to(device)
                     imgs, poses, hwf, bound = imgs.squeeze(), poses.squeeze(), hwf.squeeze(), bound.squeeze()
@@ -496,7 +535,16 @@ def main():
                     tto_imgs, test_imgs = torch.split(imgs, [args.tto_views, args.test_views], dim=0)
                     tto_poses, test_poses = torch.split(poses, [args.tto_views, args.test_views], dim=0)
                     
-                    scene_psnr = validate_MAML(meta_model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, inner_lr, args)            
+                    if args.meta == 'MAML':
+                        scene_psnr = validate_MAML(meta_model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, inner_lr, args)            
+                    else:
+                        val_model.load_state_dict(meta_trained_state)
+                        val_optim = torch.optim.SGD(val_model.parameters(), args.tto_lr)
+                        inner_loop_Reptile(val_model, val_optim, tto_imgs, tto_poses, hwf,
+                                    bound, args.num_samples, args.tto_batchsize, args.tto_steps)
+                        
+                        scene_psnr = report_result(val_model, test_imgs, test_poses, hwf, bound, args.test_batchsize,
+                                                    args.num_samples, args.tto_showImages)
                                                 
                     test_psnrs.append(scene_psnr)
             
