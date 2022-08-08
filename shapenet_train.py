@@ -216,6 +216,12 @@ def validate_MAML(model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound,
     '''
         train and report the result of model
     '''
+    
+    if tto_imgs.shape[0] == 1:
+        plt.imshow(tto_imgs[0].cpu())
+        plt.title('The only input Image')
+        plt.show()
+        
     # prepare data
     pixels = tto_imgs.reshape(-1, 3)
     rays_o, rays_d = get_rays_shapenet(hwf, tto_poses)
