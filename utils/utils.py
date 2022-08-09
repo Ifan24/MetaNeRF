@@ -17,7 +17,6 @@ def make_dir(args):
     checkpoint_path = f"{args.checkpoint_path}/{now}"
     os.makedirs(checkpoint_path, exist_ok=True)
     print(f"make directory {checkpoint_path}")
-    checkpoint_path
     
     with open(f'{checkpoint_path}/config.json', 'w') as fp:
         json.dump(vars(args), fp, indent=4)

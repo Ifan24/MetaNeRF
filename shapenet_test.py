@@ -96,6 +96,10 @@ def test():
         for key, value in info.items():
             args.__dict__[key] = value
 
+    if args.one_scene:
+        print("change TTO views to 25")
+        args.tto_views = 25
+        
     print(vars(args))
     
     if args.make_checkpoint_dir:
@@ -157,10 +161,9 @@ def test():
         else:
             print(f"scene {idx+1}, psnr:{scene_psnr:.3f}")
             
-        test_psnrs.append(scene_psnr)
+        test_psnrs.append(scene_psnr.item())
         
-        pbar.set_postfix(mean_psnr=torch.stack(test_psnrs).mean().item())
-        print(test_psnrs)
+        print(f"test dataset mean psnr: {sum(test_psnrs) / len(test_psnrs)}")
         with open(f'{args.checkpoint_path}/test_psnr.txt', 'w') as f:
             psnr = {
                 'test': test_psnrs,
@@ -169,9 +172,8 @@ def test():
                     
         idx += 1
     
-    test_psnrs = torch.stack(test_psnrs)
     print("----------------------------------")
-    print(f"test dataset mean psnr: {test_psnrs.mean():.3f}")
+    print(f"test dataset mean psnr: {(sum(test_psnrs) / len(test_psnrs)):.3f}")
 
 
 if __name__ == '__main__':
