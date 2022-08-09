@@ -45,7 +45,25 @@ def get_per_step_loss_importance_vector(inner_steps, MSL_iterations, current_ite
     loss_weights = torch.Tensor(loss_weights).to(device=device)
     return loss_weights
 
+def shuffle_imgs(imgs, poses):
+    """shuffle the images and poses, assume there are more than one images
+
+    Returns:
+        choose one images as target image and return the rest
+    """
+        
+    # shuffle the images
+    indexes = torch.randperm(imgs.shape[0])
+    imgs = imgs[indexes]
+    poses = poses[indexes]
     
+    target_imgs = imgs[0]
+    target_poses = poses[0]
+    
+    imgs = imgs[1:]
+    poses = poses[1:]
+    return imgs, poses, target_imgs, target_poses
+
 def prepare_MAML_data(imgs, poses, batch_size, hwf, device):
     '''
         divided data into batches with len batch_size
@@ -57,15 +75,17 @@ def prepare_MAML_data(imgs, poses, batch_size, hwf, device):
     # assume the MAML batch < 128 and training view > 1
     
     # shuffle the images
-    indexes = torch.randperm(imgs.shape[0])
-    imgs = imgs[indexes]
-    poses = poses[indexes]
+    # indexes = torch.randperm(imgs.shape[0])
+    # imgs = imgs[indexes]
+    # poses = poses[indexes]
     
-    target_imgs = imgs[0]
-    target_poses = poses[0]
+    # target_imgs = imgs[0]
+    # target_poses = poses[0]
     
-    imgs = imgs[1:]
-    poses = poses[1:]
+    # imgs = imgs[1:]
+    # poses = poses[1:]
+    
+    imgs, poses, target_imgs, target_poses = shuffle_imgs(imgs, poses)
     
     def shuffle_pixels(imgs, poses):
         pixels = imgs.reshape(-1, 3)
@@ -271,29 +291,35 @@ def update_inner_steps(task_difficulty, min_steps=1, max_steps=16, cache_size=10
     new_inner_steps = remap(difficulty_rank, 0, cache_size, min_steps, max_steps)
     return int(new_inner_steps), difficulty_rank
      
-def inner_loop_Reptile(model, optim, imgs, poses, hwf, bound, num_samples, raybatch_size, inner_steps):
+def inner_loop_Reptile(model, imgs, poses, hwf, bound, num_samples, raybatch_size, inner_steps, inner_lr):
     """
     train the inner model for a specified number of iterations
     """
+    if imgs.shape[0] > 1:
+        imgs, poses, target_imgs, target_poses = shuffle_imgs(imgs, poses)
+    else:
+        # print("only one image")
+        # TTO view = 1 or SV meta learning
+        target_imgs, target_poses = imgs, poses
+    
     pixels = imgs.reshape(-1, 3)
-
     rays_o, rays_d = get_rays_shapenet(hwf, poses)
     rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
-
     num_rays = rays_d.shape[0]
+    
+    params = None
     for step in range(inner_steps):
-        indices = torch.randint(num_rays, size=[raybatch_size])
-        raybatch_o, raybatch_d = rays_o[indices], rays_d[indices]
-        pixelbatch = pixels[indices] 
-        t_vals, xyz = sample_points(raybatch_o, raybatch_d, bound[0], bound[1],
-                                    num_samples, perturb=True)
-        
-        optim.zero_grad()
-        rgbs, sigmas = model(xyz)
-        colors = volume_render(rgbs, sigmas, t_vals, white_bkgd=True)
-        loss = F.mse_loss(colors, pixelbatch)
-        loss.backward()
-        optim.step()
+        loss = compute_loss(model, num_rays, raybatch_size, rays_o, rays_d, pixels, num_samples, bound, params)
+        model.zero_grad()
+        params = inner_loop_update(model, loss, current_step=step, params=params, 
+                                    inner_lr=inner_lr, first_order=True)
+                                    
+    pixels = target_imgs.reshape(-1, 3)
+    rays_o, rays_d = get_rays_shapenet(hwf, target_poses)
+    rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
+    num_rays = rays_d.shape[0]
+    
+    return compute_loss(model, num_rays, raybatch_size, rays_o, rays_d, pixels, num_samples, bound, params)
 
 # python shapenet_train.py --config configs/shapenet/chairs.json
 def main():
@@ -410,13 +436,18 @@ def main():
             device=device, requires_grad=args.learn_inner_lr)        
         
     if args.learn_inner_lr:
+        
         if args.per_layer_inner_lr:
-            meta_optim.add_param_group({'params': inner_lr.values()})
+            if args.meta == 'MAML':
+                meta_optim.add_param_group({'params': inner_lr.values()})
+            else:
+                lr_optim = torch.optim.Adam(inner_lr.values(), lr=args.meta_lr)
         else:
-            meta_optim.add_param_group({'params': [inner_lr]})
+            if args.meta == 'MAML':
+                meta_optim.add_param_group({'params': [inner_lr]})
+            else:
+                lr_optim = torch.optim.Adam([inner_lr], lr=args.meta_lr)
                 
-        # meta_optim.add_param_group({'params': inner_lr.values()
-        #     if args.per_layer_inner_lr else [inner_lr]})
     # ============================
 
     if args.resume_step != 0:
@@ -492,22 +523,25 @@ def main():
             
             else:
                 meta_optim.zero_grad()
-    
+                
                 inner_model = copy.deepcopy(meta_model)
-                inner_optim = torch.optim.SGD(inner_model.parameters(), args.inner_lr)
-        
-                inner_loop_Reptile(inner_model, inner_optim, imgs, poses,
+                # inner_optim = torch.optim.SGD(inner_model.parameters(), args.inner_lr)
+                
+                loss = inner_loop_Reptile(inner_model, imgs, poses,
                             hwf, bound, args.num_samples,
-                            args.train_batchsize, args.inner_steps)
+                            args.train_batchsize, args.inner_steps, inner_lr)
                             
                 # Reptile
                 with torch.no_grad():
                     for meta_param, inner_param in zip(meta_model.parameters(), inner_model.parameters()):
                         meta_param.grad = meta_param - inner_param
-                
-                meta_optim.step()
                         
-
+                meta_optim.step()
+                
+                lr_optim.zero_grad()
+                loss.backward()
+                lr_optim.step()
+                
         
             if step % args.val_freq == 0 and step != args.resume_step:
                 # show one of the validation result
@@ -530,9 +564,9 @@ def main():
                         scene_psnr = validate_MAML(meta_model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, inner_lr, args)            
                     else:
                         val_model.load_state_dict(meta_trained_state)
-                        val_optim = torch.optim.SGD(val_model.parameters(), args.tto_lr)
-                        inner_loop_Reptile(val_model, val_optim, tto_imgs, tto_poses, hwf,
-                                    bound, args.num_samples, args.tto_batchsize, args.tto_steps)
+                        # val_optim = torch.optim.SGD(val_model.parameters(), args.tto_lr)
+                        inner_loop_Reptile(val_model, tto_imgs, tto_poses, hwf,
+                                    bound, args.num_samples, args.tto_batchsize, args.tto_steps, inner_lr)
                         
                         scene_psnr = report_result(val_model, test_imgs, test_poses, hwf, bound, args.test_batchsize,
                                                     args.num_samples, args.tto_showImages)
@@ -624,12 +658,12 @@ def main():
             if args.use_scheduler:
                 scheduler.step()
                 
-                if args.plot_lr:
-                    for (name, param) in meta_model.meta_named_parameters():
-                        inner_lrs[name].append(inner_lr[name][0].item())
-                    
-                    for idx, lr_list in enumerate(inner_per_step_lr):
-                        lr_list.append(inner_lr[first_layer_name][idx].item())
+            if args.plot_lr:
+                for (name, param) in meta_model.meta_named_parameters():
+                    inner_lrs[name].append(inner_lr[name][0].item())
+                
+                for idx, lr_list in enumerate(inner_per_step_lr):
+                    lr_list.append(inner_lr[first_layer_name][idx].item())
                                     
             step += 1
             pbar.update(1)
