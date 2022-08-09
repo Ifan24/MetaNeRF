@@ -40,7 +40,7 @@
     "train_batchsize": 128,
     "num_samples": 128,
     "inner_lr": 0.5,
-    "inner_steps": 3,
+    "inner_steps": 32,
 
     "tto_views": 1,
     "tto_lr": 0.5,

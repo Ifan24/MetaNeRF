@@ -8,6 +8,7 @@ from datasets.shapenet import build_shapenet
 from models.nerf import build_nerf
 from utils.shape_video import create_360_video
 from models.rendering import get_rays_shapenet, sample_points, volume_render
+from utils.utils import make_dir
 try:
   import google.colab
   from tqdm.notebook import tqdm as tqdm
@@ -86,6 +87,8 @@ def test():
     parser.add_argument('--standard_init', action='store_true', help="train and validate the model without meta learning parameters")
     parser.add_argument('--meta', type=str, default='Reptile', choices=['MAML', 'Reptile'],
                         help='meta algorithm, (MAML, Reptile)')
+    parser.add_argument('--make_checkpoint_dir', action='store_true',
+                        help='make a directory in checkpoint_path with name as current time')
     args = parser.parse_args()
 
     with open(args.config) as config:
@@ -93,7 +96,11 @@ def test():
         for key, value in info.items():
             args.__dict__[key] = value
 
-    print(args)
+    print(vars(args))
+    
+    if args.make_checkpoint_dir:
+        args.checkpoint_path = make_dir(args)
+        
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     test_set = build_shapenet(image_set="test", dataset_root=args.dataset_root,
@@ -153,6 +160,13 @@ def test():
         test_psnrs.append(scene_psnr)
         
         pbar.set_postfix(mean_psnr=torch.stack(test_psnrs).mean().item())
+        print(test_psnrs)
+        with open(f'{args.checkpoint_path}/test_psnr.txt', 'w') as f:
+            psnr = {
+                'test': test_psnrs,
+            }
+            f.write(json.dumps(psnr))
+                    
         idx += 1
     
     test_psnrs = torch.stack(test_psnrs)

@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader, Subset
 from datasets.shapenet import build_shapenet
 from models.nerf import build_nerf
 from models.rendering import get_rays_shapenet, sample_points, volume_render
+from utils.utils import make_dir
 try:
   import google.colab
   from tqdm.notebook import tqdm as tqdm
@@ -18,8 +19,6 @@ from torchmeta.utils.gradient_based import gradient_update_parameters as GUP
 import matplotlib.pyplot as plt
 from collections import OrderedDict
 
-from datetime import datetime
-import os
 import numpy as np
 from torchmeta.modules import MetaModule
 
@@ -334,15 +333,7 @@ def main():
     print(vars(args))
     
     if args.make_checkpoint_dir:
-        # dd/mm/YY H:M:S
-        now = datetime.now().strftime("%d-%m-%Y-%H-%M-%S")
-        checkpoint_path = f"{args.checkpoint_path}/{now}"
-        os.makedirs(checkpoint_path, exist_ok=True)
-        print(f"make directory {checkpoint_path}")
-        args.checkpoint_path = checkpoint_path
-        
-        with open(f'{args.checkpoint_path}/config.json', 'w') as fp:
-            json.dump(vars(args), fp)
+        args.checkpoint_path = make_dir(args)
         
         
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
