@@ -31,7 +31,7 @@ def train_val_scene(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf
     rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
     num_rays = rays_d.shape[0]
 
-    if args.per_param_inner_lr:
+    if args.per_layer_inner_lr:
         params = []
         for (name, param) in model.meta_named_parameters():
             params.append({
@@ -121,7 +121,7 @@ def test():
     if not args.standard_init:
         checkpoint = torch.load(args.weight_path, map_location=device)
         meta_state = checkpoint['meta_model_state_dict']
-        if args.per_param_inner_lr:
+        if args.per_layer_inner_lr:
             inner_lr = checkpoint['inner_lr']
 
     savedir = Path(args.savedir)

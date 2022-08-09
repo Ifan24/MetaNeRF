@@ -15,7 +15,7 @@
     "meta": "Reptile",
     "MAML_batch": 3,
     "learn_inner_lr": false,
-    "per_param_inner_lr": false,
+    "per_layer_inner_lr": false,
     "use_scheduler": false,
     "scheduler_min_lr": 5e-6,
     "plot_lr": false,

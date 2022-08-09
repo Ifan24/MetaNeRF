@@ -310,8 +310,8 @@ def main():
     parser.add_argument('--learn_inner_lr', action='store_true',
                         help='the inner lr is a learnable (meta-trained) additional argument')
     # Meta-SGD
-    parser.add_argument('--per_param_inner_lr', action='store_true',
-                        help='the inner lr parameter is different for each parameter of the model. Has no impact unless `learn_inner_lr=True')
+    parser.add_argument('--per_layer_inner_lr', action='store_true',
+                        help='the inner lr parameter is different for each layers of the model. Has no impact unless `learn_inner_lr=True')
     # MAML++
     parser.add_argument('--use_scheduler', action='store_true',
                         help='use scheduler to adjust outer loop lr')   
@@ -376,7 +376,7 @@ def main():
     # if args.learn_inner_step:
     #     meta_optim.add_param_group({'params': [inner_steps]})
     
-    # learnable inner_lr & per_param_inner_lr
+    # learnable inner_lr & per_layer_inner_lr
     # ============================
     # log the first layer's per step learning rate
     inner_lr = args.inner_lr
@@ -386,7 +386,7 @@ def main():
         first_layer_name = name
         break
     
-    if args.per_param_inner_lr:
+    if args.per_layer_inner_lr:
         # for logging the inner lr
         inner_lrs = OrderedDict((name, [inner_lr]) for (name, param)
             in meta_model.meta_named_parameters())
@@ -410,13 +410,13 @@ def main():
             device=device, requires_grad=args.learn_inner_lr)        
         
     if args.learn_inner_lr:
-        if args.per_param_inner_lr:
+        if args.per_layer_inner_lr:
             meta_optim.add_param_group({'params': inner_lr.values()})
         else:
             meta_optim.add_param_group({'params': [inner_lr]})
                 
         # meta_optim.add_param_group({'params': inner_lr.values()
-        #     if args.per_param_inner_lr else [inner_lr]})
+        #     if args.per_layer_inner_lr else [inner_lr]})
     # ============================
 
     if args.resume_step != 0:
@@ -471,7 +471,7 @@ def main():
                             
                         outer_loss += loss
                       
-                    if args.per_param_inner_lr: 
+                    if args.per_layer_inner_lr: 
                         pbar.set_postfix({
                             'inner_lr': inner_lr['net.1.weight'][0].item(), 
                             "outer_lr" : scheduler.get_last_lr()[0], 
@@ -556,7 +556,7 @@ def main():
                 print(val_psnrs)
                 
                 if args.plot_lr:
-                    if args.per_param_inner_lr:
+                    if args.per_layer_inner_lr:
                         plt.subplots()
                         plt.ylabel("inner learning rate")
                         plt.xlabel("iterations")
