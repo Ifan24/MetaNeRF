@@ -123,7 +123,7 @@ def compute_loss(model, num_rays, raybatch_size, rays_o, rays_d, pixels, num_sam
     loss = F.mse_loss(colors, pixelbatch)
     return loss
     
-def inner_loop_update(model, loss, current_step, params=None, inner_lr=0.5, first_order=False):
+def inner_loop_update(model, loss, current_step, params=None, inner_lr=0.5, init_lr=0.5, first_order=False):
     if not isinstance(model, MetaModule):
         raise ValueError('The model must be an instance of `torchmeta.modules.'
                          'MetaModule`, got `{0}`'.format(type(model)))
@@ -141,7 +141,7 @@ def inner_loop_update(model, loss, current_step, params=None, inner_lr=0.5, firs
         for (name, param), grad in zip(params.items(), grads):
             # validation
             if current_step >= len(inner_lr[name]):
-                updated_params[name] = param - inner_lr[name][0] * grad
+                updated_params[name] = param - init_lr * grad
             
             # Training
             else:
@@ -153,7 +153,7 @@ def inner_loop_update(model, loss, current_step, params=None, inner_lr=0.5, firs
 
     return updated_params
     
-def inner_loop(model, bound, num_samples, raybatch_size, inner_steps, inner_lr, train_data, per_step_loss_importance_vectors=None, first_order=True):
+def inner_loop(model, bound, num_samples, raybatch_size, inner_steps, inner_lr, train_data, per_step_loss_importance_vectors=None, first_order=True, init_lr=0.5):
     pixels, rays_o, rays_d, num_rays = train_data['support']
     target_pixels, target_rays_o, target_rays_d, target_num_rays = train_data['target']
     
@@ -164,7 +164,7 @@ def inner_loop(model, bound, num_samples, raybatch_size, inner_steps, inner_lr, 
         model.zero_grad()
         # params = GUP(model, loss, params=params, step_size=inner_lr, first_order=first_order)
         params = inner_loop_update(model, loss, current_step=step, params=params, 
-                                    inner_lr=inner_lr, first_order=first_order)
+                                    inner_lr=inner_lr, init_lr=init_lr, first_order=first_order)
         
         if per_step_loss_importance_vectors is not None:
             loss = compute_loss(model, target_num_rays, raybatch_size, target_rays_o, target_rays_d, target_pixels, num_samples, bound, params)
@@ -179,7 +179,7 @@ def inner_loop(model, bound, num_samples, raybatch_size, inner_steps, inner_lr, 
              
     return final_loss
                     
-def report_result(model, test_imgs, test_poses, hwf, bound, raybatch_size, num_samples, tto_showImages, params=None):
+def report_result(model, test_imgs, test_poses, hwf, bound, raybatch_size, num_samples, tto_showImages, params=None, show_img=True):
     """
         render images in test_poses and compute the PSNR against the test_imgs
         using the params as the model weight if provided, if not then use the model weight
@@ -269,7 +269,7 @@ def validate_MAML(model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound,
         
         # params = GUP(model, loss, params=params, step_size=inner_lr, first_order=True)
         params = inner_loop_update(model, loss, current_step=step, params=params, 
-                                    inner_lr=inner_lr, first_order=True)
+                                    inner_lr=inner_lr, init_lr=args.tto_lr, first_order=True)
         
     # use the param from TTO on test imgs
     return report_result(model, test_imgs, test_poses, hwf, bound, 
@@ -291,16 +291,16 @@ def update_inner_steps(task_difficulty, min_steps=1, max_steps=16, cache_size=10
     new_inner_steps = remap(difficulty_rank, 0, cache_size, min_steps, max_steps)
     return int(new_inner_steps), difficulty_rank
      
-def inner_loop_Reptile(model, imgs, poses, hwf, bound, num_samples, raybatch_size, inner_steps, inner_lr):
+def inner_loop_Reptile(model, imgs, poses, hwf, bound, num_samples, raybatch_size, inner_steps, inner_lr, init_lr):
     """
     train the inner model for a specified number of iterations
     """
-    if imgs.shape[0] > 1:
-        imgs, poses, target_imgs, target_poses = shuffle_imgs(imgs, poses)
-    else:
-        # print("only one image")
-        # TTO view = 1 or SV meta learning
-        target_imgs, target_poses = imgs, poses
+    # if imgs.shape[0] > 1:
+    #     imgs, poses, target_imgs, target_poses = shuffle_imgs(imgs, poses)
+    # else:
+    #     # print("only one image")
+    #     # TTO view = 1 or SV meta learning
+    #     target_imgs, target_poses = imgs, poses
     
     pixels = imgs.reshape(-1, 3)
     rays_o, rays_d = get_rays_shapenet(hwf, poses)
@@ -312,15 +312,30 @@ def inner_loop_Reptile(model, imgs, poses, hwf, bound, num_samples, raybatch_siz
         loss = compute_loss(model, num_rays, raybatch_size, rays_o, rays_d, pixels, num_samples, bound, params)
         model.zero_grad()
         params = inner_loop_update(model, loss, current_step=step, params=params, 
-                                    inner_lr=inner_lr, first_order=True)
-                                    
-    pixels = target_imgs.reshape(-1, 3)
-    rays_o, rays_d = get_rays_shapenet(hwf, target_poses)
-    rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
-    num_rays = rays_d.shape[0]
+                                    inner_lr=inner_lr, init_lr=init_lr, first_order=True)
+                               
+    model.load_state_dict(params, strict=False)
     
+    # pixels = target_imgs.reshape(-1, 3)
+    # rays_o, rays_d = get_rays_shapenet(hwf, target_poses)
+    # rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
+    # num_rays = rays_d.shape[0]
+    
+    # return compute_loss(model, num_rays, raybatch_size, rays_o, rays_d, pixels, num_samples, bound, params)
     return compute_loss(model, num_rays, raybatch_size, rays_o, rays_d, pixels, num_samples, bound, params)
-
+    
+def apply_lr(model, inner_lr, init_lr, inner_step):
+    """apply inner learning rate for each layer
+    """
+    params = []
+    for (name, param) in model.meta_named_parameters():
+        params.append({
+            'params': param,
+            'lr': inner_lr[name][inner_step].item()
+        })
+    optim = torch.optim.SGD(params, init_lr)
+    return optim
+    
 # python shapenet_train.py --config configs/shapenet/chairs.json
 def main():
     parser = argparse.ArgumentParser(description='shapenet few-shot view synthesis')
@@ -433,7 +448,9 @@ def main():
         
     else:
         inner_lr = torch.tensor(inner_lr, dtype=torch.float32,
-            device=device, requires_grad=args.learn_inner_lr)        
+            device=device, requires_grad=args.learn_inner_lr)
+        inner_lrs = []
+        inner_lrs.append(inner_lr.item())
         
     if args.learn_inner_lr:
         
@@ -498,6 +515,7 @@ def main():
                         loss = inner_loop(meta_model, bound, args.num_samples,
                             args.train_batchsize, inner_steps, inner_lr, train_data[i],
                             per_step_loss_importance_vectors=per_step_loss_importance_vectors,
+                            init_lr=args.inner_lr,
                             first_order= not (args.use_second_order and step>args.first_order_to_second_order_iteration))
                             
                         outer_loss += loss
@@ -529,7 +547,7 @@ def main():
                 
                 loss = inner_loop_Reptile(inner_model, imgs, poses,
                             hwf, bound, args.num_samples,
-                            args.train_batchsize, args.inner_steps, inner_lr)
+                            args.train_batchsize, args.inner_steps, inner_lr, args.inner_lr)
                             
                 # Reptile
                 with torch.no_grad():
@@ -538,9 +556,10 @@ def main():
                         
                 meta_optim.step()
                 
-                lr_optim.zero_grad()
-                loss.backward()
-                lr_optim.step()
+                if args.learn_inner_lr:
+                    lr_optim.zero_grad()
+                    loss.backward()
+                    lr_optim.step()
                 
         
             if step % args.val_freq == 0 and step != args.resume_step:
@@ -552,7 +571,7 @@ def main():
                     meta_trained_state = meta_model.state_dict()
                     val_model = copy.deepcopy(meta_model)
                 
-                
+                count = 0
                 for imgs, poses, hwf, bound in tqdm(val_loader, desc = 'Validating'):
                     imgs, poses, hwf, bound = imgs.to(device), poses.to(device), hwf.to(device), bound.to(device)
                     imgs, poses, hwf, bound = imgs.squeeze(), poses.squeeze(), hwf.squeeze(), bound.squeeze()
@@ -566,12 +585,13 @@ def main():
                         val_model.load_state_dict(meta_trained_state)
                         # val_optim = torch.optim.SGD(val_model.parameters(), args.tto_lr)
                         inner_loop_Reptile(val_model, tto_imgs, tto_poses, hwf,
-                                    bound, args.num_samples, args.tto_batchsize, args.tto_steps, inner_lr)
+                                    bound, args.num_samples, args.tto_batchsize, args.tto_steps, inner_lr, args.inner_lr)
                         
                         scene_psnr = report_result(val_model, test_imgs, test_poses, hwf, bound, args.test_batchsize,
-                                                    args.num_samples, args.tto_showImages)
+                                                    args.num_samples, args.tto_showImages, None, count<=2)
                                                 
                     test_psnrs.append(scene_psnr)
+                    count+=1
             
                 val_psnr = torch.stack(test_psnrs).mean()
                 
@@ -598,7 +618,11 @@ def main():
                         for (name, lrs) in inner_lrs.items():
                             plt.plot(lrs, label=name)
                         
-                        plt.legend()
+                        if len(inner_lrs) <= 8:
+                            plt.legend()
+                        else:
+                            plt.legend(bbox_to_anchor=(1.04,1), loc="upper left")
+                        
                         plt.savefig(f'{args.checkpoint_path}/{step}_lr.png')
                         plt.show()
                     
@@ -610,11 +634,25 @@ def main():
                         plt.title(f"per layers per steps inner learning rate for layer {first_layer_name}")
                         for (idx, lrs) in enumerate(inner_per_step_lr):
                             plt.plot(lrs, label=f"inner step {idx}")
+                            
+                        if len(inner_per_step_lr) <= 8:
+                            plt.legend()
+                        else:
+                            plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
                         
-                        plt.legend()
                         plt.savefig(f'{args.checkpoint_path}/{step}_per_steps_lr.png')
                         plt.show()
                     
+                    else:
+                        plt.subplots()
+                        plt.ylabel("inner learning rate")
+                        plt.xlabel("iterations")
+                        plt.title("inner learning rate")
+                        plt.plot(inner_lrs, label="inner learning rate")
+                        
+                        plt.legend()
+                        plt.savefig(f'{args.checkpoint_path}/{step}_lr.png')
+                        plt.show()
                     # ===================
                     if args.learn_inner_step:
                         plt.subplots()
@@ -659,12 +697,15 @@ def main():
                 scheduler.step()
                 
             if args.plot_lr:
-                for (name, param) in meta_model.meta_named_parameters():
-                    inner_lrs[name].append(inner_lr[name][0].item())
-                
-                for idx, lr_list in enumerate(inner_per_step_lr):
-                    lr_list.append(inner_lr[first_layer_name][idx].item())
-                                    
+                if args.per_layer_inner_lr:
+                    for (name, param) in meta_model.meta_named_parameters():
+                        inner_lrs[name].append(inner_lr[name][0].item())
+                    
+                    for idx, lr_list in enumerate(inner_per_step_lr):
+                        lr_list.append(inner_lr[first_layer_name][idx].item())
+                else:
+                    inner_lrs.append(inner_lr.item())
+                    
             step += 1
             pbar.update(1)
             
