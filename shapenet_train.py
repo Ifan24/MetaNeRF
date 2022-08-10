@@ -2,6 +2,7 @@ import argparse
 import json
 import copy
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from datasets.shapenet import build_shapenet
@@ -140,12 +141,13 @@ def inner_loop_update(model, loss, current_step, params=None, inner_lr=0.5, init
     if isinstance(inner_lr, (dict, OrderedDict)):
         for (name, param), grad in zip(params.items(), grads):
             # validation
-            if current_step >= len(inner_lr[name]):
-                updated_params[name] = param - init_lr * grad
+            # if current_step >= len(inner_lr[name]):
+            #     updated_params[name] = param - init_lr * grad
             
-            # Training
-            else:
-                updated_params[name] = param - inner_lr[name][current_step] * grad
+            # # Training
+            # else:
+            #     updated_params[name] = param - inner_lr[name][current_step] * grad
+            updated_params[name] = param - inner_lr[name] * grad
 
     else:
         for (name, param), grad in zip(params.items(), grads):
@@ -322,7 +324,20 @@ def inner_loop_Reptile(model, imgs, poses, hwf, bound, num_samples, raybatch_siz
     # num_rays = rays_d.shape[0]
     
     # return compute_loss(model, num_rays, raybatch_size, rays_o, rays_d, pixels, num_samples, bound, params)
-    return compute_loss(model, num_rays, raybatch_size, rays_o, rays_d, pixels, num_samples, bound, params)
+    
+    
+# def inner_loop_Reptile(model, optim, imgs, poses, hwf, bound, num_samples, raybatch_size, inner_steps):
+#     pixels = imgs.reshape(-1, 3)
+#     rays_o, rays_d = get_rays_shapenet(hwf, poses)
+#     rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
+#     num_rays = rays_d.shape[0]
+    
+#     for step in range(inner_steps):
+#         optim.zero_grad()
+#         loss = compute_loss(model, num_rays, raybatch_size, rays_o, rays_d, pixels, num_samples, bound)
+#         loss.backward()
+#         optim.step()
+        
     
 def apply_lr(model, inner_lr, init_lr, inner_step):
     """apply inner learning rate for each layer
@@ -421,7 +436,7 @@ def main():
     # ============================
     # log the first layer's per step learning rate
     inner_lr = args.inner_lr
-    inner_per_step_lr = [[] for _ in range(args.inner_steps_max if args.learn_inner_step else args.inner_steps)]
+    # inner_per_step_lr = [[] for _ in range(args.inner_steps_max if args.learn_inner_step else args.inner_steps)]
     
     for (name, param) in meta_model.meta_named_parameters():
         first_layer_name = name
@@ -433,18 +448,23 @@ def main():
             in meta_model.meta_named_parameters())
         
         # for each step and each layer, create a learnable inner lr (LSLR)
-        init_inner_lr = torch.ones(args.inner_steps_max if args.learn_inner_step else args.inner_steps) * inner_lr
-        init_inner_lr.to(device)
+        # init_inner_lr = torch.ones(args.inner_steps_max if args.learn_inner_step else args.inner_steps) * inner_lr
+        # init_inner_lr.to(device)
         # inner_lr = OrderedDict()
         # for (name, param) in meta_model.meta_named_parameters():
         #     inner_lr[name] = init_inner_lr.clone().detach().requires_grad_(args.learn_inner_lr).to(device)
             
-        inner_lr = OrderedDict((name,
-            torch.tensor(init_inner_lr, 
-            dtype=param.dtype, 
-            device=device,
-            requires_grad=args.learn_inner_lr)) 
-            for (name, param) in meta_model.meta_named_parameters())
+        # inner_lr = OrderedDict((name,
+        #     torch.tensor(init_inner_lr, 
+        #     dtype=param.dtype, 
+        #     device=device,
+        #     requires_grad=args.learn_inner_lr)) 
+        #     for (name, param) in meta_model.meta_named_parameters())
+        
+        inner_lr = OrderedDict()
+        for (name, param) in meta_model.meta_named_parameters():
+            # inner_lr[name] = args.inner_lr * torch.ones_like(param, requires_grad=True)
+            inner_lr[name] = nn.Parameter(args.inner_lr * torch.ones_like(param, requires_grad=True))
         
     else:
         inner_lr = torch.tensor(inner_lr, dtype=torch.float32,
@@ -545,7 +565,7 @@ def main():
                 inner_model = copy.deepcopy(meta_model)
                 # inner_optim = torch.optim.SGD(inner_model.parameters(), args.inner_lr)
                 
-                loss = inner_loop_Reptile(inner_model, imgs, poses,
+                inner_loop_Reptile(inner_model, imgs, poses,
                             hwf, bound, args.num_samples,
                             args.train_batchsize, args.inner_steps, inner_lr, args.inner_lr)
                             
@@ -558,8 +578,16 @@ def main():
                 
                 if args.learn_inner_lr:
                     lr_optim.zero_grad()
-                    loss.backward()
+                    # loss.backward()
+                    
+                    for (name, param) in meta_model.meta_named_parameters():
+                        # inner_lr[key] = args.inner_lr * torch.ones_like(param, requires_grad=True)
+                        # inner_lr[key] = nn.Parameter(args.inner_lr * torch.ones_like(param, requires_grad=True))
+                        # print(param.grad)
+                        inner_lr[name].grad = param.grad
+                        
                     lr_optim.step()
+                    
                 
         
             if step % args.val_freq == 0 and step != args.resume_step:
@@ -628,20 +656,20 @@ def main():
                     
                     # ===================
                     
-                        plt.subplots()
-                        plt.ylabel("per step learning rate")
-                        plt.xlabel("iterations")
-                        plt.title(f"per layers per steps inner learning rate for layer {first_layer_name}")
-                        for (idx, lrs) in enumerate(inner_per_step_lr):
-                            plt.plot(lrs, label=f"inner step {idx}")
+                        # plt.subplots()
+                        # plt.ylabel("per step learning rate")
+                        # plt.xlabel("iterations")
+                        # plt.title(f"per layers per steps inner learning rate for layer {first_layer_name}")
+                        # for (idx, lrs) in enumerate(inner_per_step_lr):
+                        #     plt.plot(lrs, label=f"inner step {idx}")
                             
-                        if len(inner_per_step_lr) <= 8:
-                            plt.legend()
-                        else:
-                            plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+                        # if len(inner_per_step_lr) <= 8:
+                        #     plt.legend()
+                        # else:
+                        #     plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
                         
-                        plt.savefig(f'{args.checkpoint_path}/{step}_per_steps_lr.png')
-                        plt.show()
+                        # plt.savefig(f'{args.checkpoint_path}/{step}_per_steps_lr.png')
+                        # plt.show()
                     
                     else:
                         plt.subplots()
@@ -699,10 +727,18 @@ def main():
             if args.plot_lr:
                 if args.per_layer_inner_lr:
                     for (name, param) in meta_model.meta_named_parameters():
-                        inner_lrs[name].append(inner_lr[name][0].item())
+                        # print(name)
+                        # print(inner_lr[name])
+                        # inner_lrs[name].append(inner_lr[name][0][0])
+                        if inner_lr[name].ndim == 1:
+                            inner_lrs[name].append(inner_lr[name][0].item())
+                        else:
+                            inner_lrs[name].append(inner_lr[name][0][0].item())
+                    # print(inner_lrs)
                     
-                    for idx, lr_list in enumerate(inner_per_step_lr):
-                        lr_list.append(inner_lr[first_layer_name][idx].item())
+                    # for idx, lr_list in enumerate(inner_per_step_lr):
+                    #     lr_list.append(inner_lr[first_layer_name][idx].item())
+                    
                 else:
                     inner_lrs.append(inner_lr.item())
                     
