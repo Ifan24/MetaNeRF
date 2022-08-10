@@ -195,7 +195,8 @@ def report_result(model, test_imgs, test_poses, hwf, bound, raybatch_size, num_s
     """
     ray_origins, ray_directions = get_rays_shapenet(hwf, test_poses)
     view_psnrs = []
-    plt.figure(figsize=(15, 6))
+    if show_img:
+        plt.figure(figsize=(15, 6))
     count = 0
     for img, rays_o, rays_d in zip(test_imgs, ray_origins, ray_directions):
         rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
@@ -220,7 +221,7 @@ def report_result(model, test_imgs, test_poses, hwf, bound, raybatch_size, num_s
             psnr = -10*torch.log10(error)
             view_psnrs.append(psnr)
             
-            if count < tto_showImages:
+            if show_img and count < tto_showImages:
                 plt.subplot(2, 5, count+1)
                 plt.imshow(img.cpu())
                 plt.title('Target')
@@ -228,8 +229,10 @@ def report_result(model, test_imgs, test_poses, hwf, bound, raybatch_size, num_s
                 plt.imshow(synth.cpu())
                 plt.title(f'synth psnr:{psnr:0.2f}')
             count += 1
-            
-    plt.show()
+    
+    if show_img:
+        plt.show()
+        
     scene_psnr = torch.stack(view_psnrs).mean()
     return scene_psnr  
     
@@ -618,7 +621,7 @@ def main():
                         scene_psnr = report_result(model=val_model, test_imgs=test_imgs, test_poses=test_poses,
                                                     hwf=hwf, bound=bound, raybatch_size=args.test_batchsize, 
                                                     num_samples=args.num_samples, tto_showImages=args.tto_showImages,
-                                                    params=None, show_img=len(test_psnrs)<=args.show_validate_scene)
+                                                    params=None, show_img=len(test_psnrs)<args.show_validate_scene)
                         # scene_psnr = report_result(val_model, test_imgs, test_poses, hwf, bound, args.test_batchsize,
                         #                             args.num_samples, args.tto_showImages, None, count<=2)
                                                 
@@ -636,7 +639,7 @@ def main():
                 plt.xlabel('Iterations')
                 plt.ylabel('PSNR')
                 plt.legend()
-                plt.savefig(f'{args.checkpoint_path}/{step}.png')
+                plt.savefig(f'{args.checkpoint_path}/{step}.png', bbox_inches='tight')
                 plt.show()
                 print(val_psnrs)
                 
@@ -649,12 +652,9 @@ def main():
                         for (name, lrs) in inner_lrs.items():
                             plt.plot(lrs, label=name)
                         
-                        if len(inner_lrs) <= 8:
-                            plt.legend()
-                        else:
-                            plt.legend(bbox_to_anchor=(1.04,1), loc="upper left")
+                        plt.legend(bbox_to_anchor=(1.04,1), loc="upper left")
                         
-                        plt.savefig(f'{args.checkpoint_path}/{step}_lr.png')
+                        plt.savefig(f'{args.checkpoint_path}/{step}_lr.png', bbox_inches='tight')
                         plt.show()
                     
                     # ===================
@@ -671,7 +671,7 @@ def main():
                         # else:
                         #     plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
                         
-                        # plt.savefig(f'{args.checkpoint_path}/{step}_per_steps_lr.png')
+                        # plt.savefig(f'{args.checkpoint_path}/{step}_per_steps_lr.png', bbox_inches='tight')
                         # plt.show()
                     
                     else:
@@ -682,7 +682,7 @@ def main():
                         plt.plot(inner_lrs, label="inner learning rate")
                         
                         plt.legend()
-                        plt.savefig(f'{args.checkpoint_path}/{step}_lr.png')
+                        plt.savefig(f'{args.checkpoint_path}/{step}_lr.png', bbox_inches='tight')
                         plt.show()
                     # ===================
                     if args.learn_inner_step:
@@ -691,7 +691,7 @@ def main():
                         plt.xlabel("iterations")
                         plt.title(f"adaptive inner steps ({args.inner_steps_min} to {args.inner_steps_max})")
                         plt.plot(log_inner_steps)
-                        plt.savefig(f'{args.checkpoint_path}/{step}_inner_steps.png')
+                        plt.savefig(f'{args.checkpoint_path}/{step}_inner_steps.png', bbox_inches='tight')
                         plt.show()
                         
                         
@@ -700,7 +700,7 @@ def main():
                         plt.xlabel("iterations")
                         plt.title(f"difficulty_rank (0 to {args.difficulty_size})")
                         plt.plot(log_difficulty_rank)
-                        plt.savefig(f'{args.checkpoint_path}/{step}_difficulty_rank.png')
+                        plt.savefig(f'{args.checkpoint_path}/{step}_difficulty_rank.png', bbox_inches='tight')
                         plt.show()
                     
                 
@@ -711,6 +711,13 @@ def main():
                         'best_val': sorted(val_psnrs,key=lambda x: x[1], reverse=True)[0]
                     }
                     f.write(json.dumps(psnr))
+                    
+                with open(f'{args.checkpoint_path}/inner_lrs.txt', 'w') as f:
+                    txt = {
+                        'inner_lrs': inner_lrs,
+                    }
+                    f.write(json.dumps(txt))
+                    
           
             if step % args.checkpoint_freq == 0 and step != args.resume_step:
                 path = f"{args.checkpoint_path}/step{step}.pth"
