@@ -39,7 +39,8 @@
     "tto_views": 1,
     "tto_lr": 0.5,
     "tto_batchsize": 64,
-    "tto_showImages": 5,
+    "tto_showImages": 5, 
+    "show_validate_scene":3,
     "tto_steps": 1000,
 
     "test_views": 25,

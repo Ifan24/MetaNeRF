@@ -599,7 +599,6 @@ def main():
                     meta_trained_state = meta_model.state_dict()
                     val_model = copy.deepcopy(meta_model)
                 
-                count = 0
                 for imgs, poses, hwf, bound in tqdm(val_loader, desc = 'Validating'):
                     imgs, poses, hwf, bound = imgs.to(device), poses.to(device), hwf.to(device), bound.to(device)
                     imgs, poses, hwf, bound = imgs.squeeze(), poses.squeeze(), hwf.squeeze(), bound.squeeze()
@@ -615,11 +614,15 @@ def main():
                         inner_loop_Reptile(val_model, tto_imgs, tto_poses, hwf,
                                     bound, args.num_samples, args.tto_batchsize, args.tto_steps, inner_lr, args.inner_lr)
                         
-                        scene_psnr = report_result(val_model, test_imgs, test_poses, hwf, bound, args.test_batchsize,
-                                                    args.num_samples, args.tto_showImages, None, count<=2)
+                        # only show imgs of two scenes
+                        scene_psnr = report_result(model=val_model, test_imgs=test_imgs, test_poses=test_poses,
+                                                    hwf=hwf, bound=bound, raybatch_size=args.test_batchsize, 
+                                                    num_samples=args.num_samples, tto_showImages=args.tto_showImages,
+                                                    params=None, show_img=len(test_psnrs)<=args.show_validate_scene)
+                        # scene_psnr = report_result(val_model, test_imgs, test_poses, hwf, bound, args.test_batchsize,
+                        #                             args.num_samples, args.tto_showImages, None, count<=2)
                                                 
                     test_psnrs.append(scene_psnr)
-                    count+=1
             
                 val_psnr = torch.stack(test_psnrs).mean()
                 
@@ -642,7 +645,7 @@ def main():
                         plt.subplots()
                         plt.ylabel("inner learning rate")
                         plt.xlabel("iterations")
-                        plt.title("per layers inner learning rate")
+                        plt.title("per param inner learning rate (first param of each layer)")
                         for (name, lrs) in inner_lrs.items():
                             plt.plot(lrs, label=name)
                         
