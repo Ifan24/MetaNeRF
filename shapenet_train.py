@@ -237,9 +237,12 @@ def report_result(model, test_imgs, test_poses, hwf, bound, raybatch_size, num_s
     return scene_psnr  
     
 def validate_MAML(model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, inner_lr, args):
-    '''
-        train and report the result of model
-    '''
+    """train on the tto images and test on the test images, using the inner_lr for training
+
+    Returns:
+        float: PSNR of test images
+    """
+
     
     if tto_imgs.shape[0] == 1:
         plt.imshow(tto_imgs[0].cpu())
@@ -464,6 +467,7 @@ def main():
         #     requires_grad=args.learn_inner_lr)) 
         #     for (name, param) in meta_model.meta_named_parameters())
         
+        # meta-SGD per param lr
         inner_lr = OrderedDict()
         for (name, param) in meta_model.meta_named_parameters():
             # inner_lr[name] = args.inner_lr * torch.ones_like(param, requires_grad=True)
@@ -474,7 +478,36 @@ def main():
             device=device, requires_grad=args.learn_inner_lr)
         inner_lrs = []
         inner_lrs.append(inner_lr.item())
+                        
+    # ============================
+    val_psnrs = []
+    train_psnrs = []
+    task_difficulty = []
+    
+    if args.resume_step != 0:
+        weight_path = f"{args.checkpoint_path}/step{args.resume_step}.pth"
+        checkpoint = torch.load(weight_path, map_location=device)
+        meta_state = checkpoint['meta_model_state_dict']
+        meta_model.load_state_dict(meta_state)
+        inner_lr = checkpoint['inner_lr']
+        meta_optim.load_state_dict(checkpoint['meta_optim_state_dict'])
         
+        with open(f'{args.checkpoint_path}/psnr.txt') as f:
+            txt = json.load(f)
+            train_psnrs = txt['train']
+            val_psnrs = txt['val']
+            inner_lrs = txt['inner_lrs']
+            # psnr = {
+            #     'train': train_psnrs,
+            #     'val' : val_psnrs,
+            #     'best_val': sorted(val_psnrs,key=lambda x: x[1], reverse=True)[0]
+            # }
+        print(val_psnrs)
+        
+        print(f"load meta_model_state_dict from {weight_path}")
+    
+    # print(meta_optim.param_groups)
+    
     if args.learn_inner_lr:
         
         if args.per_layer_inner_lr:
@@ -488,26 +521,10 @@ def main():
             else:
                 lr_optim = torch.optim.Adam([inner_lr], lr=args.meta_lr)
                 
-    # ============================
-
-    if args.resume_step != 0:
-        weight_path = f"{args.checkpoint_path}/step{args.resume_step}.pth"
-        checkpoint = torch.load(weight_path, map_location=device)
-        meta_state = checkpoint['meta_model_state_dict']
-        meta_model.load_state_dict(meta_state)
-        inner_lr = checkpoint['inner_lr']
-        meta_optim.load_state_dict(checkpoint['meta_optim_state_dict'])
-        
-        print(f"load meta_model_state_dict from {weight_path}")
-    
-    # print(meta_optim.param_groups)
-    
     step = args.resume_step
     pbar = tqdm(total=args.max_iters, desc = 'Training')
     pbar.update(args.resume_step)
-    val_psnrs = []
-    train_psnrs = []
-    task_difficulty = []
+
     while step < args.max_iters:
         for imgs, poses, hwf, bound in train_loader:                    
             # imgs = [1, train_views(25), H(128), W(128), C(3)]
