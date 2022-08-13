@@ -16,9 +16,9 @@ except:
   from tqdm import tqdm as tqdm
   
 import matplotlib.pyplot as plt
-from shapenet_train import validate_MAML, compute_loss, report_result
+from shapenet_train import inner_loop_Reptile, validate_MAML, compute_loss, report_result
 from torchmeta.utils.gradient_based import gradient_update_parameters as GUP
-
+from collections import OrderedDict
 
 def train_val_scene(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, inner_lr=0.5):
     """
@@ -31,16 +31,7 @@ def train_val_scene(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf
     rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
     num_rays = rays_d.shape[0]
 
-    if args.per_layer_inner_lr:
-        params = []
-        for (name, param) in model.meta_named_parameters():
-            params.append({
-                'params': param,
-                'lr': inner_lr[name][0].item()
-            })
-        optim = torch.optim.SGD(params, args.tto_lr)
-    else:
-        optim = torch.optim.SGD(model.parameters(), args.tto_lr)
+    optim = torch.optim.SGD(model.parameters(), args.tto_lr)
     
     val_psnrs = []
     for step in tqdm(range(args.train_val_steps), desc = 'Train & Validate'):
@@ -74,6 +65,60 @@ def train_val_scene(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf
             train_val_freq = 2500
         elif step > 50000 and step <= 100000:
             train_val_freq = 5000
+    print(val_psnrs)
+
+
+
+def train_val_scene_with_lr(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, inner_lr=0.5, weight=1):
+    """
+    train and val the model on available views
+    weight: lr = learned lr * weight
+    """
+    train_val_freq = 100
+    
+    if isinstance(inner_lr, (dict, OrderedDict)):
+        new_inner_lr = OrderedDict()
+        for (key, value) in inner_lr:
+            new_inner_lr[key] = value*weight
+        inner_lr = new_inner_lr
+    else:
+        inner_lr = inner_lr * weight
+    
+    val_psnrs = []
+    pbar = tqdm(total=args.train_val_steps, desc = 'Train & Validate')
+    step = 0
+    
+    while step < args.train_val_steps:
+        with torch.no_grad():
+            scene_psnr = report_result(model, test_imgs, test_poses, hwf, bound, 
+                            args.test_batchsize, args.num_samples, args.tto_showImages)
+        
+        # Plot validation PSNR
+        val_psnrs.append((step, scene_psnr.item()))
+        print(f"step: {step}, val psnr: {scene_psnr:0.3f}")
+        plt.plot(*zip(*val_psnrs), label="val_psnr")
+        plt.title(f'ShapeNet Reconstruction from {args.tto_views} views')
+        plt.xlabel('Iterations')
+        plt.ylabel('PSNR')
+        plt.legend()
+        plt.show()
+        
+        inner_loop_Reptile(model=model, imgs=tto_imgs, poses=tto_poses, hwf=hwf, bound=bound,
+            num_samples=args.num_samples, raybatch_size=args.tto_batchsize, inner_steps=train_val_freq,
+            inner_lr=inner_lr, init_lr=args.tto_lr)
+
+        step += train_val_freq
+        pbar.update(train_val_freq)
+
+        if step < 1000:
+            train_val_freq = 100
+        elif step >= 1000 and step < 10000:
+            train_val_freq = 500
+        elif step >= 10000 and step < 50000:
+            train_val_freq = 2500
+        elif step >= 50000 and step < 100000:
+            train_val_freq = 5000
+        
     print(val_psnrs)
 
 
@@ -136,8 +181,11 @@ def test():
             
             if not args.standard_init:
                 model.load_state_dict(meta_state)
-                
-            train_val_scene(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, inner_lr)
+             
+            if args.learn_inner_lr:
+                train_val_scene_with_lr(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, inner_lr, args.tto_lr_weight)
+            else:
+                train_val_scene(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, args.tto_lr)
             
             return
     
