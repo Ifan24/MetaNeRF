@@ -140,14 +140,18 @@ def inner_loop_update(model, loss, current_step, params=None, inner_lr=0.5, init
 
     if isinstance(inner_lr, (dict, OrderedDict)):
         for (name, param), grad in zip(params.items(), grads):
-            # validation
-            # if current_step >= len(inner_lr[name]):
-            #     updated_params[name] = param - init_lr * grad
+            if type(inner_lr[name]) == float:
+                updated_params[name] = param - inner_lr[name] * grad
+            else:
+                # use per step lr
+                # validation
+                if current_step >= len(inner_lr[name]):
+                    updated_params[name] = param - init_lr * grad
+                
+                # Training
+                else:
+                    updated_params[name] = param - inner_lr[name][current_step] * grad
             
-            # # Training
-            # else:
-            #     updated_params[name] = param - inner_lr[name][current_step] * grad
-            updated_params[name] = param - inner_lr[name] * grad
 
     else:
         for (name, param), grad in zip(params.items(), grads):
@@ -236,7 +240,7 @@ def report_result(model, test_imgs, test_poses, hwf, bound, raybatch_size, num_s
     scene_psnr = torch.stack(view_psnrs).mean()
     return scene_psnr  
     
-def validate_MAML(model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, inner_lr, args):
+def validate_MAML(model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, inner_lr, args, show_img=True):
     """train on the tto images and test on the test images, using the inner_lr for training
 
     Returns:
@@ -244,7 +248,7 @@ def validate_MAML(model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound,
     """
 
     
-    if tto_imgs.shape[0] == 1:
+    if show_img and tto_imgs.shape[0] == 1:
         plt.imshow(tto_imgs[0].cpu())
         plt.title('The only input Image')
         plt.show()
@@ -281,7 +285,8 @@ def validate_MAML(model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound,
         
     # use the param from TTO on test imgs
     return report_result(model, test_imgs, test_poses, hwf, bound, 
-                args.test_batchsize, args.num_samples, args.tto_showImages, params)    
+                args.test_batchsize, args.num_samples, args.tto_showImages, params, 
+                show_img=show_img)    
 
 # based on the past N task to update the inner steps
 def update_inner_steps(task_difficulty, min_steps=1, max_steps=16, cache_size=100):
@@ -329,7 +334,7 @@ def inner_loop_Reptile(model, imgs, poses, hwf, bound, num_samples, raybatch_siz
     # rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
     # num_rays = rays_d.shape[0]
     
-    # return compute_loss(model, num_rays, raybatch_size, rays_o, rays_d, pixels, num_samples, bound, params)
+    return compute_loss(model, num_rays, raybatch_size, rays_o, rays_d, pixels, num_samples, bound, params)
     
     
 # def inner_loop_Reptile(model, optim, imgs, poses, hwf, bound, num_samples, raybatch_size, inner_steps):
@@ -356,6 +361,28 @@ def apply_lr(model, inner_lr, init_lr, inner_step):
         })
     optim = torch.optim.SGD(params, init_lr)
     return optim
+    
+def map_lr(args, inner_lr):
+    weight = 1
+    if args.per_layer_inner_lr:
+        weight = args.tto_lr_weight
+    print(inner_lr)
+    if isinstance(inner_lr, (dict, OrderedDict)):
+        new_inner_lr = OrderedDict()
+        
+        for (key, value) in inner_lr.items():
+            if type(value) == float:
+                new_inner_lr[key] = value*weight
+            else:
+                # use per step lr
+                new_inner_lr[key] = [v * weight for v in value]
+                
+        inner_lr = new_inner_lr
+    else:
+        inner_lr = inner_lr * weight
+    print("======================")
+    print(inner_lr)
+    return inner_lr
     
 # python shapenet_train.py --config configs/shapenet/chairs.json
 def main():
@@ -442,7 +469,7 @@ def main():
     # ============================
     # log the first layer's per step learning rate
     inner_lr = args.inner_lr
-    # inner_per_step_lr = [[] for _ in range(args.inner_steps_max if args.learn_inner_step else args.inner_steps)]
+    inner_per_step_lr = [[] for _ in range(args.inner_steps_max if args.learn_inner_step else args.inner_steps)]
     
     for (name, param) in meta_model.meta_named_parameters():
         first_layer_name = name
@@ -454,25 +481,25 @@ def main():
             in meta_model.meta_named_parameters())
         
         # for each step and each layer, create a learnable inner lr (LSLR)
-        # init_inner_lr = torch.ones(args.inner_steps_max if args.learn_inner_step else args.inner_steps) * inner_lr
-        # init_inner_lr.to(device)
-        # inner_lr = OrderedDict()
-        # for (name, param) in meta_model.meta_named_parameters():
-        #     inner_lr[name] = init_inner_lr.clone().detach().requires_grad_(args.learn_inner_lr).to(device)
+        if args.use_per_step_lr:
+            init_inner_lr = torch.ones(args.inner_steps_max if args.learn_inner_step else args.inner_steps) * inner_lr
+            init_inner_lr.to(device)
+            # inner_lr = OrderedDict()
+            # for (name, param) in meta_model.meta_named_parameters():
+            #     inner_lr[name] = init_inner_lr.clone().detach().requires_grad_(args.learn_inner_lr).to(device)
+                
+            inner_lr = OrderedDict((name,
+                torch.tensor(init_inner_lr, 
+                dtype=param.dtype, 
+                device=device,
+                requires_grad=args.learn_inner_lr)) 
+                for (name, param) in meta_model.meta_named_parameters())
+        else:
+            # meta-SGD per param lr
+            inner_lr = OrderedDict()
+            for (name, param) in meta_model.meta_named_parameters():
+                inner_lr[name] = nn.Parameter(args.inner_lr * torch.ones_like(param, requires_grad=True))
             
-        # inner_lr = OrderedDict((name,
-        #     torch.tensor(init_inner_lr, 
-        #     dtype=param.dtype, 
-        #     device=device,
-        #     requires_grad=args.learn_inner_lr)) 
-        #     for (name, param) in meta_model.meta_named_parameters())
-        
-        # meta-SGD per param lr
-        inner_lr = OrderedDict()
-        for (name, param) in meta_model.meta_named_parameters():
-            # inner_lr[name] = args.inner_lr * torch.ones_like(param, requires_grad=True)
-            inner_lr[name] = nn.Parameter(args.inner_lr * torch.ones_like(param, requires_grad=True))
-        
     else:
         inner_lr = torch.tensor(inner_lr, dtype=torch.float32,
             device=device, requires_grad=args.learn_inner_lr)
@@ -497,16 +524,9 @@ def main():
             train_psnrs = txt['train']
             val_psnrs = txt['val']
             inner_lrs = txt['inner_lrs']
-            # psnr = {
-            #     'train': train_psnrs,
-            #     'val' : val_psnrs,
-            #     'best_val': sorted(val_psnrs,key=lambda x: x[1], reverse=True)[0]
-            # }
-        print(val_psnrs)
-        
+
         print(f"load meta_model_state_dict from {weight_path}")
     
-    # print(meta_optim.param_groups)
     
     if args.learn_inner_lr:
         
@@ -534,50 +554,49 @@ def main():
             if args.meta == 'MAML':
                 # after step, optimizer will update inner per step learning rate and inner step
                 # it makes more sense to use the same scene to get a new loss for the updated hyper params
-                for _ in range(args.MAML_stage):
-                    per_step_loss_importance_vectors = None
-                    # task_inner_steps = to_int(inner_steps, args.inner_steps_min, args.inner_steps_max)
-                    if args.use_MSL and step < args.MSL_iterations:
-                        per_step_loss_importance_vectors = get_per_step_loss_importance_vector(
-                                    inner_steps, args.MSL_iterations, step, device)
-                    
-                    
-                    # https://github.com/tristandeleu/pytorch-meta/blob/master/examples/maml/train.py
-                    outer_loss = torch.tensor(0.).to(device)
-                    batch_size = args.MAML_batch
-                    train_data = prepare_MAML_data(imgs, poses, batch_size, hwf, device)
-                                        
-                    # In MAML, the losses of a batch tasks were used to update meta parameter 
-                    # but the batch of tasks in NeRF does not makes too much sense
-                    # should it be a batch of scenes? or a batch of pixels in a single scene
-                    for i in range(batch_size):
-                        # update parameter with the inner loop loss
-                        loss = inner_loop(meta_model, bound, args.num_samples,
-                            args.train_batchsize, inner_steps, inner_lr, train_data[i],
-                            per_step_loss_importance_vectors=per_step_loss_importance_vectors,
-                            init_lr=args.inner_lr,
-                            first_order= not (args.use_second_order and step>args.first_order_to_second_order_iteration))
-                            
-                        outer_loss += loss
-                      
-                    if args.per_layer_inner_lr: 
-                        pbar.set_postfix({
-                            'inner_lr': inner_lr['net.1.weight'][0].item(), 
-                            "outer_lr" : scheduler.get_last_lr()[0], 
-                            'Train loss': loss.item()
-                        })
-                    meta_optim.zero_grad()
-                    outer_loss.div_(batch_size)
-                    outer_loss.backward()
+                per_step_loss_importance_vectors = None
+                # task_inner_steps = to_int(inner_steps, args.inner_steps_min, args.inner_steps_max)
+                if args.use_MSL and step < args.MSL_iterations:
+                    per_step_loss_importance_vectors = get_per_step_loss_importance_vector(
+                                inner_steps, args.MSL_iterations, step, device)
                 
-                    meta_optim.step()
-                    
-                    task_difficulty.append(outer_loss.item()) 
-                    if step >= args.difficulty_size and args.learn_inner_step:
-                        inner_steps, difficulty_rank = update_inner_steps(task_difficulty, args.inner_steps_min, args.inner_steps_max, args.difficulty_size)
-                        if step % 10 == 0:
-                            log_difficulty_rank.append(difficulty_rank)
-                            log_inner_steps.append(inner_steps)
+                
+                # https://github.com/tristandeleu/pytorch-meta/blob/master/examples/maml/train.py
+                outer_loss = torch.tensor(0.).to(device)
+                batch_size = args.MAML_batch
+                train_data = prepare_MAML_data(imgs, poses, batch_size, hwf, device)
+                                    
+                # In MAML, the losses of a batch tasks were used to update meta parameter 
+                # but the batch of tasks in NeRF does not makes too much sense
+                # should it be a batch of scenes? or a batch of pixels in a single scene
+                for i in range(batch_size):
+                    # update parameter with the inner loop loss
+                    loss = inner_loop(meta_model, bound, args.num_samples,
+                        args.train_batchsize, inner_steps, inner_lr, train_data[i],
+                        per_step_loss_importance_vectors=per_step_loss_importance_vectors,
+                        init_lr=args.inner_lr,
+                        first_order= not (args.use_second_order and step>args.first_order_to_second_order_iteration))
+                        
+                    outer_loss += loss
+                  
+                if args.per_layer_inner_lr: 
+                    pbar.set_postfix({
+                        'inner_lr': inner_lr['net.1.weight'][0].item(), 
+                        "outer_lr" : scheduler.get_last_lr()[0] if args.use_scheduler else args.meta_lr, 
+                        'Train loss': loss.item()
+                    })
+                meta_optim.zero_grad()
+                outer_loss.div_(batch_size)
+                outer_loss.backward()
+            
+                meta_optim.step()
+                
+                task_difficulty.append(outer_loss.item()) 
+                if args.learn_inner_step and step >= args.difficulty_size:
+                    inner_steps, difficulty_rank = update_inner_steps(task_difficulty, args.inner_steps_min, args.inner_steps_max, args.difficulty_size)
+                    if step % 10 == 0:
+                        log_difficulty_rank.append(difficulty_rank)
+                        log_inner_steps.append(inner_steps)
             
             else:
                 meta_optim.zero_grad()
@@ -585,7 +604,7 @@ def main():
                 inner_model = copy.deepcopy(meta_model)
                 # inner_optim = torch.optim.SGD(inner_model.parameters(), args.inner_lr)
                 
-                inner_loop_Reptile(inner_model, imgs, poses,
+                loss = inner_loop_Reptile(inner_model, imgs, poses,
                             hwf, bound, args.num_samples,
                             args.train_batchsize, args.inner_steps, inner_lr, args.inner_lr)
                             
@@ -598,19 +617,24 @@ def main():
                 
                 if args.learn_inner_lr:
                     lr_optim.zero_grad()
-                    # loss.backward()
                     
-                    for (name, param) in meta_model.meta_named_parameters():
-                        # inner_lr[key] = args.inner_lr * torch.ones_like(param, requires_grad=True)
-                        # inner_lr[key] = nn.Parameter(args.inner_lr * torch.ones_like(param, requires_grad=True))
-                        # print(param.grad)
-                        inner_lr[name].grad = param.grad
+                    # use loss to update
+                    loss.backward()
+                    
+                    # use grad to update
+                    # for (name, param) in meta_model.meta_named_parameters():
+                    #     # inner_lr[key] = args.inner_lr * torch.ones_like(param, requires_grad=True)
+                    #     # inner_lr[key] = nn.Parameter(args.inner_lr * torch.ones_like(param, requires_grad=True))
+                    #     # print(param.grad)
+                    #     inner_lr[name].grad = param.grad
                         
                     lr_optim.step()
                     
                 
         
             if step % args.val_freq == 0 and step != args.resume_step:
+
+                TTO_inner_lr = map_lr(args, inner_lr)
                 # show one of the validation result
                 test_psnrs = []
                 if args.meta == 'MAML':
@@ -627,12 +651,13 @@ def main():
                     tto_poses, test_poses = torch.split(poses, [args.tto_views, args.test_views], dim=0)
                     
                     if args.meta == 'MAML':
-                        scene_psnr = validate_MAML(meta_model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, inner_lr, args)            
+                        scene_psnr = validate_MAML(meta_model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, 
+                                TTO_inner_lr, args, len(test_psnrs)<args.show_validate_scene)            
                     else:
                         val_model.load_state_dict(meta_trained_state)
                         # val_optim = torch.optim.SGD(val_model.parameters(), args.tto_lr)
                         inner_loop_Reptile(val_model, tto_imgs, tto_poses, hwf,
-                                    bound, args.num_samples, args.tto_batchsize, args.tto_steps, inner_lr, args.inner_lr)
+                                    bound, args.num_samples, args.tto_batchsize, args.tto_steps, TTO_inner_lr, args.inner_lr)
                         
                         # only show imgs of two scenes
                         scene_psnr = report_result(model=val_model, test_imgs=test_imgs, test_poses=test_poses,
@@ -674,23 +699,6 @@ def main():
                         plt.savefig(f'{args.checkpoint_path}/{step}_lr.png', bbox_inches='tight')
                         plt.show()
                     
-                    # ===================
-                    
-                        # plt.subplots()
-                        # plt.ylabel("per step learning rate")
-                        # plt.xlabel("iterations")
-                        # plt.title(f"per layers per steps inner learning rate for layer {first_layer_name}")
-                        # for (idx, lrs) in enumerate(inner_per_step_lr):
-                        #     plt.plot(lrs, label=f"inner step {idx}")
-                            
-                        # if len(inner_per_step_lr) <= 8:
-                        #     plt.legend()
-                        # else:
-                        #     plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
-                        
-                        # plt.savefig(f'{args.checkpoint_path}/{step}_per_steps_lr.png', bbox_inches='tight')
-                        # plt.show()
-                    
                     else:
                         plt.subplots()
                         plt.ylabel("inner learning rate")
@@ -700,6 +708,21 @@ def main():
                         
                         plt.legend()
                         plt.savefig(f'{args.checkpoint_path}/{step}_lr.png', bbox_inches='tight')
+                        plt.show()
+                        
+                        
+                    # ===================
+                    if type(inner_lr[first_layer_name]) == list:
+                        plt.subplots()
+                        plt.ylabel("per step learning rate")
+                        plt.xlabel("iterations")
+                        plt.title(f"per layers per steps inner learning rate for layer {first_layer_name}")
+                        for (idx, lrs) in enumerate(inner_per_step_lr):
+                            plt.plot(lrs, label=f"inner step {idx}")
+                            
+                        plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+                        
+                        plt.savefig(f'{args.checkpoint_path}/{step}_per_steps_lr.png', bbox_inches='tight')
                         plt.show()
                     # ===================
                     if args.learn_inner_step:
@@ -763,8 +786,9 @@ def main():
                             inner_lrs[name].append(inner_lr[name][0][0].item())
                     # print(inner_lrs)
                     
-                    # for idx, lr_list in enumerate(inner_per_step_lr):
-                    #     lr_list.append(inner_lr[first_layer_name][idx].item())
+                    if type(inner_lr[first_layer_name]) == list:
+                        for idx, lr_list in enumerate(inner_per_step_lr):
+                            lr_list.append(inner_lr[first_layer_name][idx].item())
                     
                 else:
                     inner_lrs.append(inner_lr.item())

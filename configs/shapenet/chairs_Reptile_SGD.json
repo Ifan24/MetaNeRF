@@ -16,7 +16,7 @@
     "MAML_batch": 3,
     "learn_inner_lr": true,
     "per_layer_inner_lr": true,
-    "use_scheduler": true,
+    "use_scheduler": false,
     "scheduler_min_lr": 5e-6,
     "plot_lr": true,
     "use_MSL": false,
@@ -39,7 +39,7 @@
     "meta_lr": 5e-4,
     "train_batchsize": 128,
     "num_samples": 128,
-    "inner_lr": 0.25,
+    "inner_lr": 0.5,
     "inner_steps": 32,
 
     "tto_views": 1,

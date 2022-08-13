@@ -16,7 +16,7 @@ except:
   from tqdm import tqdm as tqdm
   
 import matplotlib.pyplot as plt
-from shapenet_train import inner_loop_Reptile, validate_MAML, compute_loss, report_result
+from shapenet_train import inner_loop_Reptile, map_lr, validate_MAML, compute_loss, report_result
 from torchmeta.utils.gradient_based import gradient_update_parameters as GUP
 from collections import OrderedDict
 
@@ -69,20 +69,12 @@ def train_val_scene(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf
 
 
 
-def train_val_scene_with_lr(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, inner_lr=0.5, weight=1):
+def train_val_scene_with_lr(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, inner_lr=0.5):
     """
     train and val the model on available views
     weight: lr = learned lr * weight
     """
     train_val_freq = 100
-    
-    if isinstance(inner_lr, (dict, OrderedDict)):
-        new_inner_lr = OrderedDict()
-        for (key, value) in inner_lr:
-            new_inner_lr[key] = value*weight
-        inner_lr = new_inner_lr
-    else:
-        inner_lr = inner_lr * weight
     
     val_psnrs = []
     pbar = tqdm(total=args.train_val_steps, desc = 'Train & Validate')
@@ -169,6 +161,7 @@ def test():
         if args.per_layer_inner_lr:
             inner_lr = checkpoint['inner_lr']
 
+    inner_lr = map_lr(args, inner_lr)
     savedir = Path(args.savedir)
     savedir.mkdir(exist_ok=True)
     
@@ -183,7 +176,7 @@ def test():
                 model.load_state_dict(meta_state)
              
             if args.learn_inner_lr:
-                train_val_scene_with_lr(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, inner_lr, args.tto_lr_weight)
+                train_val_scene_with_lr(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, inner_lr)
             else:
                 train_val_scene(args, model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, args.tto_lr)
             
