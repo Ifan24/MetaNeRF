@@ -97,7 +97,7 @@ def train_val_scene_with_lr(args, model, tto_imgs, tto_poses, test_imgs, test_po
         
         inner_loop_Reptile(model=model, imgs=tto_imgs, poses=tto_poses, hwf=hwf, bound=bound,
             num_samples=args.num_samples, raybatch_size=args.tto_batchsize, inner_steps=train_val_freq,
-            inner_lr=inner_lr, init_lr=args.tto_lr)
+            inner_lr=inner_lr, init_lr=args.tto_lr, tto_lr_weight=args.tto_lr_weight, validation=True)
 
         step += train_val_freq
         pbar.update(train_val_freq)
@@ -161,7 +161,7 @@ def test():
         if args.per_layer_inner_lr:
             inner_lr = checkpoint['inner_lr']
 
-    inner_lr = map_lr(args, inner_lr)
+    # inner_lr = map_lr(args, inner_lr)
     savedir = Path(args.savedir)
     savedir.mkdir(exist_ok=True)
     

@@ -277,16 +277,19 @@ def validate_MAML(model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound,
         # OOM when tto_step>100 as MAML need to backprop to all those step
         # https://github.com/tristandeleu/pytorch-maml/issues/21
         # always use first order when validating
-        
+        mapped_lr = map_lr(inner_lr, args.tto_lr_weight, step, args.tto_steps)
         # params = GUP(model, loss, params=params, step_size=inner_lr, first_order=True)
         params = inner_loop_update(model, loss, current_step=step, params=params, 
-                                    inner_lr=inner_lr, init_lr=args.tto_lr, first_order=True)
+                                    inner_lr=mapped_lr, init_lr=args.tto_lr, first_order=True)
         
     # use the param from TTO on test imgs
     return report_result(model, test_imgs, test_poses, hwf, bound, 
                 args.test_batchsize, args.num_samples, args.tto_showImages, params, 
                 show_img=show_img)    
 
+def remap(x, in_min, in_max, out_min, out_max):
+    return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+    
 # based on the past N task to update the inner steps
 def update_inner_steps(task_difficulty, min_steps=1, max_steps=16, cache_size=100):
     # only keep track of last N task
@@ -297,13 +300,12 @@ def update_inner_steps(task_difficulty, min_steps=1, max_steps=16, cache_size=10
     difficulty_rank = current_task.index(last_task)
     # difficulty_rank is in range of (0, cache_size)
     
-    def remap(x, in_min, in_max, out_min, out_max):
-        return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
     
     new_inner_steps = remap(difficulty_rank, 0, cache_size, min_steps, max_steps)
     return int(new_inner_steps), difficulty_rank
      
-def inner_loop_Reptile(model, imgs, poses, hwf, bound, num_samples, raybatch_size, inner_steps, inner_lr, init_lr):
+def inner_loop_Reptile(model, imgs, poses, hwf, bound, num_samples, raybatch_size, inner_steps, inner_lr, init_lr, 
+        tto_lr_weight=1, validation=False):
     """
     train the inner model for a specified number of iterations
     """
@@ -323,8 +325,12 @@ def inner_loop_Reptile(model, imgs, poses, hwf, bound, num_samples, raybatch_siz
     for step in range(inner_steps):
         loss = compute_loss(model, num_rays, raybatch_size, rays_o, rays_d, pixels, num_samples, bound, params)
         model.zero_grad()
+        mapped_lr = inner_lr
+        if validation:
+            mapped_lr = map_lr(inner_lr, tto_lr_weight, step, inner_steps)
+            
         params = inner_loop_update(model, loss, current_step=step, params=params, 
-                                    inner_lr=inner_lr, init_lr=init_lr, first_order=True)
+                                    inner_lr=mapped_lr, init_lr=init_lr, first_order=True)
                                
     model.load_state_dict(params, strict=False)
     
@@ -361,12 +367,16 @@ def apply_lr(model, inner_lr, init_lr, inner_step):
     optim = torch.optim.SGD(params, init_lr)
     return optim
     
-def map_lr(args, inner_lr):
-    weight = 1
-    if args.per_layer_inner_lr:
-        weight = args.tto_lr_weight
-    if weight == 1:
+def map_lr(inner_lr, tto_lr_weight, current_step, max_step):
+
+    if tto_lr_weight == 1:
         return inner_lr
+    # weight = tto_lr_weight * (current_step/max_step)
+    # map from (max_step, 0) to (weight, 1)
+    # current_step = 0 -> weight = 1
+    # current_step = max_step -> weight = tto_lr_weight
+    
+    weight = remap(current_step, max_step, 0, tto_lr_weight, 1)
         
     # print(inner_lr)
     if isinstance(inner_lr, (dict, OrderedDict)):
@@ -636,7 +646,7 @@ def main():
         
             if step % args.val_freq == 0 and step != args.resume_step:
 
-                TTO_inner_lr = map_lr(args, inner_lr)
+                # TTO_inner_lr = map_lr(args, inner_lr)
                 # show one of the validation result
                 test_psnrs = []
                 if args.meta == 'MAML':
@@ -654,12 +664,13 @@ def main():
                     
                     if args.meta == 'MAML':
                         scene_psnr = validate_MAML(meta_model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound, 
-                                TTO_inner_lr, args, len(test_psnrs)<args.show_validate_scene)            
+                                inner_lr, args, len(test_psnrs)<args.show_validate_scene)            
                     else:
                         val_model.load_state_dict(meta_trained_state)
                         # val_optim = torch.optim.SGD(val_model.parameters(), args.tto_lr)
                         inner_loop_Reptile(val_model, tto_imgs, tto_poses, hwf,
-                                    bound, args.num_samples, args.tto_batchsize, args.tto_steps, TTO_inner_lr, args.inner_lr)
+                                    bound, args.num_samples, args.tto_batchsize, args.tto_steps, inner_lr, args.inner_lr, 
+                                    args.tto_lr_weight, validation=True)
                         
                         # only show imgs of two scenes
                         scene_psnr = report_result(model=val_model, test_imgs=test_imgs, test_poses=test_poses,
