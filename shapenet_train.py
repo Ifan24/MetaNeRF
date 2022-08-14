@@ -140,9 +140,7 @@ def inner_loop_update(model, loss, current_step, params=None, inner_lr=0.5, init
 
     if isinstance(inner_lr, (dict, OrderedDict)):
         for (name, param), grad in zip(params.items(), grads):
-            if type(inner_lr[name]) == float:
-                updated_params[name] = param - inner_lr[name] * grad
-            else:
+            if type(inner_lr[name]) == list:
                 # use per step lr
                 # validation
                 if current_step >= len(inner_lr[name]):
@@ -151,6 +149,8 @@ def inner_loop_update(model, loss, current_step, params=None, inner_lr=0.5, init
                 # Training
                 else:
                     updated_params[name] = param - inner_lr[name][current_step] * grad
+            else:
+                updated_params[name] = param - inner_lr[name] * grad
             
 
     else:
@@ -260,7 +260,6 @@ def validate_MAML(model, tto_imgs, tto_poses, test_imgs, test_poses, hwf, bound,
     num_rays = rays_d.shape[0]
     # TTO training
     params = None
-    
     for step in range(args.tto_steps):
         loss = compute_loss(model, num_rays, args.tto_batchsize, rays_o, rays_d, pixels, args.num_samples, bound, params)
         
@@ -374,11 +373,11 @@ def map_lr(args, inner_lr):
         new_inner_lr = OrderedDict()
         
         for (key, value) in inner_lr.items():
-            if type(value) == float:
-                new_inner_lr[key] = value*weight
-            else:
+            if type(value) == list:
                 # use per step lr
                 new_inner_lr[key] = [v * weight for v in value]
+            else:
+                new_inner_lr[key] = value*weight
                 
         inner_lr = new_inner_lr
     else:
