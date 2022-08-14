@@ -366,7 +366,10 @@ def map_lr(args, inner_lr):
     weight = 1
     if args.per_layer_inner_lr:
         weight = args.tto_lr_weight
-    print(inner_lr)
+    if weight == 1:
+        return inner_lr
+        
+    # print(inner_lr)
     if isinstance(inner_lr, (dict, OrderedDict)):
         new_inner_lr = OrderedDict()
         
@@ -380,8 +383,8 @@ def map_lr(args, inner_lr):
         inner_lr = new_inner_lr
     else:
         inner_lr = inner_lr * weight
-    print("======================")
-    print(inner_lr)
+    # print("======================")
+    # print(inner_lr)
     return inner_lr
     
 # python shapenet_train.py --config configs/shapenet/chairs.json
@@ -712,7 +715,7 @@ def main():
                         
                         
                     # ===================
-                    if type(inner_lr[first_layer_name]) == list:
+                    if type(inner_lr[first_layer_name]) != float:
                         plt.subplots()
                         plt.ylabel("per step learning rate")
                         plt.xlabel("iterations")
@@ -786,7 +789,7 @@ def main():
                             inner_lrs[name].append(inner_lr[name][0][0].item())
                     # print(inner_lrs)
                     
-                    if type(inner_lr[first_layer_name]) == list:
+                    if type(inner_lr[first_layer_name]) != float:
                         for idx, lr_list in enumerate(inner_per_step_lr):
                             lr_list.append(inner_lr[first_layer_name][idx].item())
                     
