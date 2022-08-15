@@ -13,7 +13,7 @@
     "checkpoint_path":"/content/drive/MyDrive/NeRF/baseline_meta_checkpoints/FOMAML_scheduler",
     
     "meta": "MAML",
-    "MAML_batch": 3,
+    "meta_batch": 3,
     "reptile_torchmeta": false,
     "learn_inner_lr": true,
     "per_layer_inner_lr": true,

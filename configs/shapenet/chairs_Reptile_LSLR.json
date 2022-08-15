@@ -13,7 +13,7 @@
     "checkpoint_path":"/content/drive/MyDrive/NeRF/MetaNeRF_checkpoints/Reptile_LSLR",
 
     "meta": "Reptile",
-    "MAML_batch": 3,
+    "meta_batch": 3,
     "learn_inner_lr": true,
     "per_layer_inner_lr": true,
     "use_scheduler": true,

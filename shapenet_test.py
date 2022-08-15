@@ -16,7 +16,7 @@ except:
   from tqdm import tqdm as tqdm
   
 import matplotlib.pyplot as plt
-from shapenet_train import inner_loop_Reptile, map_lr, validate_MAML, compute_loss, report_result
+from shapenet_train import inner_loop_Reptile, inner_loop_update, map_lr, validate_MAML, compute_loss, report_result
 from torchmeta.utils.gradient_based import gradient_update_parameters as GUP
 from collections import OrderedDict
 
@@ -80,27 +80,42 @@ def train_val_scene_with_lr(args, model, tto_imgs, tto_poses, test_imgs, test_po
     pbar = tqdm(total=args.train_val_steps, desc = 'Train & Validate')
     step = 0
     
+    pixels = tto_imgs.reshape(-1, 3)
+    rays_o, rays_d = get_rays_shapenet(hwf, tto_poses)
+    rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
+    num_rays = rays_d.shape[0]
+        
     while step < args.train_val_steps:
-        with torch.no_grad():
-            scene_psnr = report_result(model, test_imgs, test_poses, hwf, bound, 
-                            args.test_batchsize, args.num_samples, args.tto_showImages)
+        if step % train_val_freq == 0:
+            with torch.no_grad():
+                scene_psnr = report_result(model, test_imgs, test_poses, hwf, bound, 
+                                args.test_batchsize, args.num_samples, args.tto_showImages)
+            
+            # Plot validation PSNR
+            val_psnrs.append((step, scene_psnr.item()))
+            print(f"step: {step}, val psnr: {scene_psnr:0.3f}")
+            plt.plot(*zip(*val_psnrs), label="val_psnr")
+            plt.title(f'ShapeNet Reconstruction from {args.tto_views} views')
+            plt.xlabel('Iterations')
+            plt.ylabel('PSNR')
+            plt.legend()
+            plt.show()
         
-        # Plot validation PSNR
-        val_psnrs.append((step, scene_psnr.item()))
-        print(f"step: {step}, val psnr: {scene_psnr:0.3f}")
-        plt.plot(*zip(*val_psnrs), label="val_psnr")
-        plt.title(f'ShapeNet Reconstruction from {args.tto_views} views')
-        plt.xlabel('Iterations')
-        plt.ylabel('PSNR')
-        plt.legend()
-        plt.show()
-        
-        inner_loop_Reptile(model=model, imgs=tto_imgs, poses=tto_poses, hwf=hwf, bound=bound,
-            num_samples=args.num_samples, raybatch_size=args.tto_batchsize, inner_steps=train_val_freq,
-            inner_lr=inner_lr, init_lr=args.tto_lr, tto_lr_weight=args.tto_lr_weight, validation=True)
+        # inner_loop_Reptile(model=model, imgs=tto_imgs, poses=tto_poses, hwf=hwf, bound=bound,
+        #     num_samples=args.num_samples, raybatch_size=args.tto_batchsize, inner_steps=train_val_freq,
+        #     inner_lr=inner_lr, init_lr=args.tto_lr, tto_lr_weight=args.tto_lr_weight, validation=True)
 
-        step += train_val_freq
-        pbar.update(train_val_freq)
+        loss = compute_loss(model, num_rays, args.tto_batchsize, rays_o, rays_d, pixels, args.num_samples, bound)
+        model.zero_grad()
+        mapped_lr = map_lr(inner_lr, args.tto_lr_weight, step, args.train_val_steps)
+        
+        params = inner_loop_update(model, loss, current_step=step, params=None, 
+                                    inner_lr=mapped_lr, init_lr=args.tto_lr, first_order=True)
+                                   
+        model.load_state_dict(params, strict=False)
+        
+        step += 1
+        pbar.update(1)
 
         if step < 1000:
             train_val_freq = 100

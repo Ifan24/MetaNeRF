@@ -13,7 +13,7 @@
     "checkpoint_path":"/content/drive/MyDrive/NeRF/MetaNeRF_checkpoints/FOMAML_tune",
     
     "meta": "MAML",
-    "MAML_batch": 5,
+    "meta_batch": 5,
     "learn_inner_lr": true,
     "per_layer_inner_lr": true,
     "use_scheduler": true,

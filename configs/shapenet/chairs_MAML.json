@@ -13,7 +13,7 @@
     "checkpoint_path":"/content/drive/MyDrive/NeRF/MetaNeRF_checkpoints/MAML_base",
     
     "meta": "MAML",
-    "MAML_batch": 3,
+    "meta_batch": 3,
     "learn_inner_lr": false,
     "per_layer_inner_lr": false,
     "use_scheduler": false,
