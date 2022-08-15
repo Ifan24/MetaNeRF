@@ -13,7 +13,7 @@
     "checkpoint_path":"/content/drive/MyDrive/NeRF/MetaNeRF_checkpoints/Reptile_SGD",
 
     "meta": "Reptile",
-    "MAML_batch": 3,
+    "meta_batch": 1,
     "learn_inner_lr": true,
     "per_layer_inner_lr": true,
     "use_scheduler": false,
@@ -48,7 +48,7 @@
     "tto_showImages": 5, 
     "show_validate_scene":3,
     "tto_steps": 1000,
-    "tto_lr_weight": 0.5,
+    "tto_lr_weight": 1,
 
     "test_views": 25,
     "test_batchsize": 4096,

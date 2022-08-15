@@ -309,12 +309,12 @@ def inner_loop_Reptile(model, imgs, poses, hwf, bound, num_samples, raybatch_siz
     """
     train the inner model for a specified number of iterations
     """
-    # if imgs.shape[0] > 1:
-    #     imgs, poses, target_imgs, target_poses = shuffle_imgs(imgs, poses)
-    # else:
-    #     # print("only one image")
-    #     # TTO view = 1 or SV meta learning
-    #     target_imgs, target_poses = imgs, poses
+    if imgs.shape[0] > 1 and not validation:
+        imgs, poses, target_imgs, target_poses = shuffle_imgs(imgs, poses)
+    else:
+        # print("only one image")
+        # TTO view = 1 or SV meta learning
+        target_imgs, target_poses = imgs, poses
     
     pixels = imgs.reshape(-1, 3)
     rays_o, rays_d = get_rays_shapenet(hwf, poses)
@@ -334,10 +334,10 @@ def inner_loop_Reptile(model, imgs, poses, hwf, bound, num_samples, raybatch_siz
                                
     model.load_state_dict(params, strict=False)
     
-    # pixels = target_imgs.reshape(-1, 3)
-    # rays_o, rays_d = get_rays_shapenet(hwf, target_poses)
-    # rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
-    # num_rays = rays_d.shape[0]
+    pixels = target_imgs.reshape(-1, 3)
+    rays_o, rays_d = get_rays_shapenet(hwf, target_poses)
+    rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
+    num_rays = rays_d.shape[0]
     
     return compute_loss(model, num_rays, raybatch_size, rays_o, rays_d, pixels, num_samples, bound, params)
     
