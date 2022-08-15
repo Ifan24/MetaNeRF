@@ -522,6 +522,7 @@ def main():
     # ============================
     val_psnrs = []
     train_psnrs = []
+    train_loss = []
     task_difficulty = []
     
     if args.resume_step != 0:
@@ -631,8 +632,8 @@ def main():
                     lr_optim.zero_grad()
                     
                     # use loss to update
+                    train_loss.append(loss)
                     loss.backward()
-                    
                     # use grad to update
                     # for (name, param) in meta_model.meta_named_parameters():
                     #     # inner_lr[key] = args.inner_lr * torch.ones_like(param, requires_grad=True)
@@ -691,12 +692,22 @@ def main():
                 plt.plot(*zip(*val_psnrs), label="Meta learning validation PSNR")
                 plt.plot(*zip(*train_psnrs), label="Meta learning Training PSNR")
                 plt.title('ShapeNet Meta learning Training PSNR')
-                plt.xlabel('Iterations')
+                plt.xlabel('Meta iterations')
                 plt.ylabel('PSNR')
                 plt.legend()
                 plt.savefig(f'{args.checkpoint_path}/{step}.png', bbox_inches='tight')
                 plt.show()
                 print(val_psnrs)
+                
+                if len(train_loss) != 0:
+                    plt.subplots()
+                    plt.plot(train_loss, label="Meta learning Training loss")
+                    plt.title('ShapeNet Meta learning Training loss')
+                    plt.xlabel('Meta iterations')
+                    plt.ylabel('loss')
+                    plt.legend()
+                    plt.savefig(f'{args.checkpoint_path}/{step}_loss.png', bbox_inches='tight')
+                    plt.show()
                 
                 if args.plot_lr:
                     if args.per_layer_inner_lr:
@@ -725,7 +736,7 @@ def main():
                         
                         
                     # ===================
-                    if type(inner_lr[first_layer_name]) != float:
+                    if args.use_per_step_lr:
                         plt.subplots()
                         plt.ylabel("per step learning rate")
                         plt.xlabel("iterations")
@@ -799,7 +810,8 @@ def main():
                             inner_lrs[name].append(inner_lr[name][0][0].item())
                     # print(inner_lrs)
                     
-                    if type(inner_lr[first_layer_name]) != float:
+                    # plot lr each step in the first layer 
+                    if args.use_per_step_lr:
                         for idx, lr_list in enumerate(inner_per_step_lr):
                             lr_list.append(inner_lr[first_layer_name][idx].item())
                     

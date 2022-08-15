@@ -17,6 +17,7 @@
     "reptile_torchmeta": false,
     "learn_inner_lr": true,
     "per_layer_inner_lr": true,
+    "use_per_step_lr": true,
     "use_scheduler": true,
     "scheduler_min_lr": 5e-5,
     "plot_lr": true,
