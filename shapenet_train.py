@@ -563,7 +563,8 @@ def main():
         for imgs, poses, hwf, bound in train_loader:                    
             # imgs = [1, train_views(25), H(128), W(128), C(3)]
             imgs, poses, hwf, bound = imgs.to(device), poses.to(device), hwf.to(device), bound.to(device)
-            imgs, poses, hwf, bound = imgs.squeeze(), poses.squeeze(), hwf.squeeze(), bound.squeeze()
+            imgs, poses, hwf, bound = imgs.squeeze(0), poses.squeeze(0), hwf.squeeze(0), bound.squeeze(0)
+            
             if args.meta == 'MAML':
                 # after step, optimizer will update inner per step learning rate and inner step
                 # it makes more sense to use the same scene to get a new loss for the updated hyper params
@@ -632,7 +633,7 @@ def main():
                     lr_optim.zero_grad()
                     
                     # use loss to update
-                    train_loss.append(loss)
+                    train_loss.append(loss.detach().cpu().item())
                     loss.backward()
                     # use grad to update
                     # for (name, param) in meta_model.meta_named_parameters():
