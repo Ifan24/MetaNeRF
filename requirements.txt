@@ -1,5 +1,6 @@
 # pytorch==1.8.1 
 # torchvision==0.9.1
+# pip install git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch
 einops==0.3.2
 livelossplot==0.5.5
 torchmeta==1.8.0
