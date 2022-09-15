@@ -135,7 +135,8 @@ def test():
                     help='config file for the shape class (cars, chairs or lamps)')    
     parser.add_argument('--weight-path', type=str, required=True,
                         help='path to the meta-trained weight file')
-    parser.add_argument('--one_scene', action='store_true', help="train and validate the model on the first scene of test dataset")
+    parser.add_argument('--one_scene', action='store_true', help="train and validate the model on the x scene of test dataset")
+    parser.add_argument('--scene_idx', type=int, default=0, help="train and validate the model on the x scene of test dataset")
     parser.add_argument('--standard_init', action='store_true', help="train and validate the model without meta learning parameters")
     parser.add_argument('--meta', type=str, default='Reptile', choices=['MAML', 'Reptile'],
                         help='meta algorithm, (MAML, Reptile)')
@@ -181,7 +182,12 @@ def test():
     savedir.mkdir(exist_ok=True)
     
     if args.one_scene:
+        cur_idx = 0
         for imgs, poses, hwf, bound in test_loader:
+            if cur_idx != args.scene_idx:
+                cur_idx += 1
+                continue
+                
             imgs, poses, hwf, bound = imgs.to(device), poses.to(device), hwf.to(device), bound.to(device)
             imgs, poses, hwf, bound = imgs.squeeze(), poses.squeeze(), hwf.squeeze(), bound.squeeze()
             tto_imgs, test_imgs = torch.split(imgs, [args.tto_views, args.test_views], dim=0)

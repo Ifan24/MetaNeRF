@@ -1,6 +1,7 @@
 import argparse
 import json
 import copy
+from tabnanny import check
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -530,14 +531,17 @@ def main():
         checkpoint = torch.load(weight_path, map_location=device)
         meta_state = checkpoint['meta_model_state_dict']
         meta_model.load_state_dict(meta_state)
-        inner_lr = checkpoint['inner_lr']
+        if 'inner_lr' in checkpoint:
+            inner_lr = checkpoint['inner_lr']
+        
         meta_optim.load_state_dict(checkpoint['meta_optim_state_dict'])
         
         with open(f'{args.checkpoint_path}/psnr.txt') as f:
             txt = json.load(f)
             train_psnrs = txt['train']
             val_psnrs = txt['val']
-            inner_lrs = txt['inner_lrs']
+            if 'inner_lrs' in txt:
+                inner_lrs = txt['inner_lrs']
 
         print(f"load meta_model_state_dict from {weight_path}")
     
